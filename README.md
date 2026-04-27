@@ -1,12 +1,12 @@
 # Codex Long-time Orchestrator
 
+[English](README.en.md)
+
 `Codex Long-time Orchestrator` 是一个把 `Codex CLI` 接到长时间工作流里的本地编排器。它面向的不是一次性问答，而是那类真正会持续几十分钟、几小时，甚至需要反复检查日志、修复问题、重新执行的工程任务。
 
  `codex` 流程进入等待、轮询、远端任务、长时间测试或 smoke 检查时，原来的会话容易中断且无法定时唤醒继续TDD。这个项目的目标，就是把“模型负责思考和执行”与“宿主进程负责等待、唤起、保存状态和展示历史”拆开，让任务能够持续跑下去，而不是停在某一次超时之后。
 
 对使用者来说，可以把它理解成一个面向工程实验循环的控制台。你在网页里和主 agent 对话，主 agent 生成计划、启动执行、在等待周期里再次被唤起检查进度、决定是否修代码或继续跑。所有这些过程都会按项目留下历史记录，便于复盘和汇报。
-
-`Codex Long-time Orchestrator` is a local orchestrator that integrates `Codex CLI` into long-term workflows. It is not designed for one-off queries, but rather for engineering tasks that typically last for several minutes, hours, or even require repeated log checking, issue resolution, and re-execution. When the `codex` process enters waiting, polling, remote tasks, long-term testing, or smoke checks, the original session is prone to interruption and cannot be awakened to continue TDD at a fixed interval. The goal of this project is to separate "the model responsible for thinking and executing" from "the host process responsible for waiting, awakening, saving state, and presenting history", allowing the task to continue running rather than stopping after a certain timeout. For users, it can be understood as a console for engineering experimentation cycles. You interact with the main agent through the web page, and the main agent generates plans, initiates execution, is awakened again during the waiting period to check progress, and decides whether to fix the code or continue running. All these processes will leave a historical record for the project, facilitating review and reporting.
 
 ## 它解决什么问题
 
@@ -86,11 +86,11 @@ npm run plan
 
 当右侧 draft 已经完整时，你点击 `Freeze Plan`，把当前草稿冻结成执行计划。随后点击 `Start Execute`，任务就会进入后台执行。网页会持续显示 run 状态、task 状态、事件流、等待时间和最近的 worker 产物。对长时间任务来说，你还可以设置检查间隔，让系统在等待一段时间后主动再次唤起模型检查进度，而不是停在某次等待之后。
 
+左侧的 run 历史会优先显示该 run 第一次 plan 对话的主题，这样同一个项目里有多次尝试时，你可以直接按任务意图回看，而不是只靠一串 run id 去辨认。
+
 如果执行被中断，系统会保留已完成 task 的状态。下一次重新进入这个 run 时，你可以继续规划，也可以直接重新发起执行，让系统从未完成部分继续往下跑。
 
 ## 常用命令
-
-最常用的命令只有几条。
 
 - 启动主界面：`orch plan`
 - 只启动网页服务：`orch serve`
@@ -103,7 +103,7 @@ npm run plan
 
 这些命令默认都以当前目录作为项目目录。如果你不在目标项目里，再补上 `--repo <path>` 即可。
 
-## 数据会存到哪里
+## 数据存储
 
 这个项目的详细运行数据主要存放在项目目录内部，而不是分散写到用户目录的各个角落。
 

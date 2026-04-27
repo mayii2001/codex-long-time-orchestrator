@@ -46,6 +46,15 @@ export interface ProjectRecord {
   runIds: string[];
 }
 
+export interface ProjectRunSummary {
+  runId: string;
+  title: string | null;
+  createdAt: string;
+  updatedAt: string;
+  phase: RunPhase;
+  status: RunStatus;
+}
+
 export interface ProjectIndex {
   projects: ProjectRecord[];
 }
@@ -123,6 +132,7 @@ export interface RunRecord {
   runId: string;
   projectId: string;
   repoPath: string;
+  title: string | null;
   createdAt: string;
   updatedAt: string;
   eventCount: number;

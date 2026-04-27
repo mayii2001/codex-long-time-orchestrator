@@ -10,6 +10,7 @@ import {
   readExecutionPlan,
   readRunState,
   setRunStatus,
+  summarizeRunTitle,
   updateRunState,
   writeDraft,
 } from "./run-store.js";
@@ -226,6 +227,7 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
 
   try {
     const { envelope, worker } = await runPlannerTurn(currentRun, conversationText);
+    const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
 
     let draftVersion = currentRun.planner.activeDraftVersion ?? 0;
     let activeDraft = await readActiveDraft(currentRun.repoPath, currentRun.runId);
@@ -252,6 +254,7 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
     await appendPlannerTurn(currentRun.repoPath, currentRun.runId, turn);
 
     const next = await updateRunState(currentRun.repoPath, currentRun.runId, {
+      title: runTitle,
       planner: {
         turnCount: turns.length + 1,
         activeDraftVersion: activeDraft?.version ?? null,
@@ -293,6 +296,7 @@ export async function submitPlannerMessageWithEvents(
     const { envelope, worker } = await runPlannerTurn(currentRun, conversationText, (jsonEvent) => {
       onEvent({ type: "planner_event", payload: jsonEvent });
     });
+    const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
 
     let draftVersion = currentRun.planner.activeDraftVersion ?? 0;
     let activeDraft = await readActiveDraft(currentRun.repoPath, currentRun.runId);
@@ -320,6 +324,7 @@ export async function submitPlannerMessageWithEvents(
     await appendPlannerTurn(currentRun.repoPath, currentRun.runId, turn);
 
     const next = await updateRunState(currentRun.repoPath, currentRun.runId, {
+      title: runTitle,
       planner: {
         turnCount: turns.length + 1,
         activeDraftVersion: activeDraft?.version ?? null,

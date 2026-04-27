@@ -10,6 +10,7 @@ import {
   listRunEvents,
   readActiveDraft,
   readProjectIndex,
+  readProjectRunSummary,
   readRunState,
   readTaskProcessDetails,
   setRunStatus,
@@ -78,7 +79,13 @@ export async function startAppServer(port: number): Promise<http.Server> {
 
       if (request.method === "GET" && pathname === "/api/projects") {
         const index = await readProjectIndex();
-        sendJson(response, 200, index.projects);
+        const projects = await Promise.all(
+          index.projects.map(async (project) => ({
+            ...project,
+            runs: await Promise.all(project.runIds.map((runId) => readProjectRunSummary(project.repoPath, runId))),
+          })),
+        );
+        sendJson(response, 200, projects);
         return;
       }
 

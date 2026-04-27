@@ -26,6 +26,7 @@ export async function createRunScaffold(input: CreateRunInput): Promise<RunRecor
     runId,
     projectId: project.projectId,
     repoPath,
+    title: null,
     createdAt: now,
     updatedAt: now,
     eventCount: 0,

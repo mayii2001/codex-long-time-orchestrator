@@ -8,6 +8,7 @@ import {
   PlannerTurnRecord,
   ProjectIndex,
   ProjectRecord,
+  ProjectRunSummary,
   RunEvent,
   RunRecord,
   RunPhase,
@@ -18,6 +19,17 @@ import {
 const ORCHESTRATOR_ROOT = ".orchestrator";
 const RUNS_DIR = "runs";
 const TASK_PROCESS_TEXT_LIMIT = 20_000;
+
+function toRunTitle(message: string | null | undefined): string | null {
+  const compact = (message ?? "").replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return null;
+  }
+  if (compact.length <= 72) {
+    return compact;
+  }
+  return `${compact.slice(0, 69).trimEnd()}...`;
+}
 
 export function getGlobalOrchestratorHome(): string {
   return process.env.ORCH_HOME || path.join(os.homedir(), ".codex", "codex-agent-orchestrator");
@@ -169,6 +181,7 @@ export async function readRunState(repoPath: string, runId: string): Promise<Run
   const parsed = JSON.parse(content) as Partial<RunRecord>;
   return {
     ...parsed,
+    title: parsed.title ?? null,
     eventCount: parsed.eventCount ?? 0,
     settings: {
       plannerModel: parsed.settings?.plannerModel ?? "gpt-5.4-mini",
@@ -193,6 +206,27 @@ export async function readRunState(repoPath: string, runId: string): Promise<Run
       executionHeartbeatAt: parsed.runtime?.executionHeartbeatAt ?? null,
     },
   } as RunRecord;
+}
+
+export async function readProjectRunSummary(repoPath: string, runId: string): Promise<ProjectRunSummary> {
+  const run = await readRunState(repoPath, runId);
+  let title = run.title;
+  if (!title) {
+    const turns = await listPlannerTurns(repoPath, runId);
+    title = toRunTitle(turns[0]?.userMessage);
+  }
+  return {
+    runId,
+    title,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    phase: run.phase,
+    status: run.status,
+  };
+}
+
+export function summarizeRunTitle(message: string): string | null {
+  return toRunTitle(message);
 }
 
 export async function appendRunEvent(repoPath: string, runId: string, event: RunEvent): Promise<void> {
