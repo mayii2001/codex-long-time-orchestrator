@@ -16,7 +16,7 @@ import {
   setRunStatus,
   updateRunState,
 } from "../orchestrator/run-store.js";
-import { executeFrozenPlan, freezeCurrentDraft, isExecutionLive, submitPlannerMessage, submitPlannerMessageWithEvents } from "../orchestrator/planner-runner.js";
+import { executeFrozenPlan, freezeCurrentDraft, isExecutionLive, maintainCompressedContext, submitPlannerMessage, submitPlannerMessageWithEvents, terminateTaskExecution } from "../orchestrator/planner-runner.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(MODULE_DIR, "..", "..");
@@ -146,6 +146,20 @@ export async function startAppServer(port: number): Promise<http.Server> {
         sendJson(response, 200, next);
         return;
       }
+      const maintainContextMatch = pathname.match(/^\/api\/runs\/([^/]+)\/context\/maintain$/);
+      if (request.method === "POST" && maintainContextMatch) {
+        const runId = decodeURIComponent(maintainContextMatch[1]);
+        const index = await readProjectIndex();
+        const project = index.projects.find((entry) => entry.runIds.includes(runId));
+        if (!project) {
+          sendJson(response, 404, { error: "Run not found" });
+          return;
+        }
+        const run = await readRunState(project.repoPath, runId);
+        const next = await maintainCompressedContext(run);
+        sendJson(response, 200, next);
+        return;
+      }
 
       const turnsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/planner\/turns$/);
       if (request.method === "GET" && turnsMatch) {
@@ -212,6 +226,21 @@ export async function startAppServer(port: number): Promise<http.Server> {
         });
         return;
       }
+      const taskTerminateMatch = pathname.match(/^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/terminate$/);
+      if (request.method === "POST" && taskTerminateMatch) {
+        const runId = decodeURIComponent(taskTerminateMatch[1]);
+        const taskId = decodeURIComponent(taskTerminateMatch[2]);
+        const index = await readProjectIndex();
+        const project = index.projects.find((entry) => entry.runIds.includes(runId));
+        if (!project) {
+          sendJson(response, 404, { error: "Run not found" });
+          return;
+        }
+        const run = await readRunState(project.repoPath, runId);
+        const next = await terminateTaskExecution(run, taskId);
+        sendJson(response, 202, next);
+        return;
+      }
 
       const messageMatch = pathname.match(/^\/api\/runs\/([^/]+)\/planner\/message$/);
       if (request.method === "POST" && messageMatch) {
@@ -253,6 +282,15 @@ export async function startAppServer(port: number): Promise<http.Server> {
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
+        const streamStartedAt = Date.now();
+        const heartbeatTimer = setInterval(() => {
+          writeSseEvent(response, {
+            type: "planner_heartbeat",
+            payload: {
+              elapsedMs: Date.now() - streamStartedAt,
+            },
+          });
+        }, 1000);
         try {
           const next = await submitPlannerMessageWithEvents(run, body.message, (event) => {
             writeSseEvent(response, event);
@@ -267,6 +305,7 @@ export async function startAppServer(port: number): Promise<http.Server> {
             },
           });
         } finally {
+          clearInterval(heartbeatTimer);
           response.end();
         }
         return;

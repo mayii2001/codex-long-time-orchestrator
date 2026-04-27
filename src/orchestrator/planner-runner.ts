@@ -15,7 +15,7 @@ import {
   updateRunState,
   writeDraft,
 } from "./run-store.js";
-import { runPlannerTurn, runTaskWorker } from "./codex-worker.js";
+import { runContextMaintenanceWorker, runPlannerTurn, runTaskWorker } from "./codex-worker.js";
 import type {
   ExecutionState,
   PlanDraft,
@@ -27,6 +27,42 @@ import type {
 
 const EXECUTION_HEARTBEAT_INTERVAL_MS = 2_000;
 const EXECUTION_HEARTBEAT_TTL_MS = 15_000;
+const activeExecutionControllers = new Map<string, AbortController>();
+
+interface TerminateTaskReason {
+  type: "task-terminated";
+  runId: string;
+  taskId: string;
+  message: string;
+}
+
+function isTerminateTaskReason(value: unknown): value is TerminateTaskReason {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && "type" in value
+    && "runId" in value
+    && "taskId" in value
+    && "message" in value
+    && (value as { type?: string }).type === "task-terminated",
+  );
+}
+
+function toExecutionAbortError(reason: unknown): Error {
+  if (reason instanceof Error) {
+    return reason;
+  }
+  if (isTerminateTaskReason(reason)) {
+    return new Error(reason.message);
+  }
+  return new Error(typeof reason === "string" ? reason : "Execution aborted.");
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw toExecutionAbortError(signal.reason);
+  }
+}
 
 export function isExecutionLive(run: RunRecord, now = Date.now()): boolean {
   if (!run.runtime.executionOwnerId || !run.runtime.executionHeartbeatAt) {
@@ -37,6 +73,32 @@ export function isExecutionLive(run: RunRecord, now = Date.now()): boolean {
     return false;
   }
   return now - heartbeatAt <= EXECUTION_HEARTBEAT_TTL_MS;
+}
+
+export async function terminateTaskExecution(run: RunRecord, taskId: string): Promise<RunRecord> {
+  const task = run.execution.tasks[taskId];
+  if (!task) {
+    throw new Error(`Task not found: ${taskId}`);
+  }
+  if (task.status !== "running" && task.status !== "waiting") {
+    throw new Error(`Task ${taskId} cannot be terminated from status ${task.status}.`);
+  }
+  const controller = activeExecutionControllers.get(run.runId);
+  if (!controller || !isExecutionLive(run)) {
+    throw new Error(`Run ${run.runId} does not have a live execution to terminate.`);
+  }
+  controller.abort({
+    type: "task-terminated",
+    runId: run.runId,
+    taskId,
+    message: `Task ${taskId} terminated by operator.`,
+  } satisfies TerminateTaskReason);
+  await appendRunEvent(run.repoPath, run.runId, {
+    timestamp: new Date().toISOString(),
+    type: "task_termination_requested",
+    detail: `Operator requested termination for task ${taskId}.`,
+  });
+  return await readRunState(run.repoPath, run.runId);
 }
 
 async function reopenRunForPlanning(run: RunRecord, reason: string): Promise<RunRecord> {
@@ -116,6 +178,17 @@ function validateDraft(draft: PlanDraft | null): string[] {
   return missing;
 }
 
+function evaluatePlannerReadiness(draft: PlanDraft | null, planComplete: boolean): { canExecute: boolean; missingFields: string[] } {
+  const missingFields = validateDraft(draft);
+  if (draft && missingFields.length === 0 && !planComplete) {
+    missingFields.push("Planner has not marked the plan complete yet.");
+  }
+  return {
+    canExecute: missingFields.length === 0,
+    missingFields,
+  };
+}
+
 function convertDraft(version: number, source: NonNullable<Awaited<ReturnType<typeof runPlannerTurn>>["envelope"]["plan_update"]>): PlanDraft {
   return {
     version,
@@ -192,9 +265,27 @@ function buildResumableExecutionState(tasks: PlanTask[], previous: ExecutionStat
   return next;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (signal) {
+        signal.removeEventListener("abort", abortListener);
+      }
+      resolve();
+    }, ms);
+    if (!signal) {
+      return;
+    }
+    const abortListener = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abortListener);
+      reject(toExecutionAbortError(signal.reason));
+    };
+    if (signal.aborted) {
+      abortListener();
+      return;
+    }
+    signal.addEventListener("abort", abortListener, { once: true });
   });
 }
 
@@ -232,7 +323,7 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
   await setPlannerStreamingState(currentRun, true);
 
   try {
-    const { envelope, worker, context: plannerContext } = await runPlannerTurn(currentRun, turns, userMessage);
+    const { envelope, worker, context: plannerContext, sessionId } = await runPlannerTurn(currentRun, turns, userMessage);
     const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
 
     let draftVersion = currentRun.planner.activeDraftVersion ?? 0;
@@ -244,8 +335,12 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
       await writeDraft(currentRun.repoPath, currentRun.runId, activeDraft);
     }
 
-    const missingFields = validateDraft(activeDraft);
-    const canExecute = missingFields.length === 0;
+    const planComplete = isExecutionLive(currentRun)
+      ? false
+      : envelope.plan_update
+        ? envelope.plan_complete
+        : (envelope.plan_complete || currentRun.planner.planComplete);
+    const readiness = evaluatePlannerReadiness(activeDraft, planComplete);
     const timestamp = new Date().toISOString();
 
     const turn: PlannerTurnRecord = {
@@ -265,8 +360,10 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
         turnCount: turns.length + 1,
         activeDraftVersion: activeDraft?.version ?? null,
         latestAssistantMessage: envelope.assistant_response,
-        canExecute,
-        missingFields,
+        sessionId: sessionId ?? currentRun.planner.sessionId,
+        planComplete,
+        canExecute: readiness.canExecute,
+        missingFields: readiness.missingFields,
         isStreaming: false,
       },
     });
@@ -303,7 +400,7 @@ export async function submitPlannerMessageWithEvents(
   onEvent({ type: "planner_started", payload: { message: "Planner started." } });
 
   try {
-    const { envelope, worker, context: plannerContext } = await runPlannerTurn(currentRun, turns, userMessage, (jsonEvent) => {
+    const { envelope, worker, context: plannerContext, sessionId } = await runPlannerTurn(currentRun, turns, userMessage, (jsonEvent) => {
       onEvent({ type: "planner_event", payload: jsonEvent });
     });
     const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
@@ -318,8 +415,12 @@ export async function submitPlannerMessageWithEvents(
       onEvent({ type: "planner_draft_updated", payload: activeDraft });
     }
 
-    const missingFields = validateDraft(activeDraft);
-    const canExecute = missingFields.length === 0;
+    const planComplete = isExecutionLive(currentRun)
+      ? false
+      : envelope.plan_update
+        ? envelope.plan_complete
+        : (envelope.plan_complete || currentRun.planner.planComplete);
+    const readiness = evaluatePlannerReadiness(activeDraft, planComplete);
     const timestamp = new Date().toISOString();
 
     const turn: PlannerTurnRecord = {
@@ -339,8 +440,10 @@ export async function submitPlannerMessageWithEvents(
         turnCount: turns.length + 1,
         activeDraftVersion: activeDraft?.version ?? null,
         latestAssistantMessage: envelope.assistant_response,
-        canExecute,
-        missingFields,
+        sessionId: sessionId ?? currentRun.planner.sessionId,
+        planComplete,
+        canExecute: readiness.canExecute,
+        missingFields: readiness.missingFields,
         isStreaming: false,
       },
     });
@@ -362,8 +465,9 @@ export async function submitPlannerMessageWithEvents(
       type: "planner_completed",
       payload: {
         assistantMessage: envelope.assistant_response,
-        canExecute,
-        missingFields,
+        planComplete,
+        canExecute: readiness.canExecute,
+        missingFields: readiness.missingFields,
         worker,
       },
     });
@@ -372,6 +476,26 @@ export async function submitPlannerMessageWithEvents(
   } finally {
     await setPlannerStreamingState(currentRun, false);
   }
+}
+
+export async function maintainCompressedContext(run: RunRecord): Promise<RunRecord> {
+  const currentRun = await readRunState(run.repoPath, run.runId);
+  const turns = await listPlannerTurns(run.repoPath, run.runId);
+  const { maintainedSummary, worker } = await runContextMaintenanceWorker(currentRun, turns);
+  const next = await updateRunState(run.repoPath, run.runId, {
+    context: {
+      ...currentRun.context,
+      maintainedSummary,
+      maintainedAt: new Date().toISOString(),
+      maintainedByModel: worker.model,
+    },
+  });
+  await appendRunEvent(run.repoPath, run.runId, {
+    timestamp: new Date().toISOString(),
+    type: "context_maintained",
+    detail: `Maintained compressed context with ${worker.model}.`,
+  });
+  return await refreshRunContext(run.repoPath, run.runId);
 }
 
 function getLongRunningCheckIntervalMs(run: RunRecord, task: PlanTask): number {
@@ -389,7 +513,9 @@ async function waitForScheduledCheck(
   task: PlanTask,
   execution: ExecutionState,
   taskState: TaskExecutionRecord,
+  signal: AbortSignal,
 ): Promise<void> {
+  throwIfAborted(signal);
   if (!taskState.nextCheckAt) {
     return;
   }
@@ -417,10 +543,11 @@ async function waitForScheduledCheck(
     type: "task_check_wait_resumed",
     detail: `Task ${task.id} resumed waiting ${remainingMs} ms until its next scheduled check.`,
   });
-  await sleep(remainingMs);
+  await sleep(remainingMs, signal);
 }
 
-async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: ExecutionState): Promise<ExecutionState> {
+async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: ExecutionState, signal: AbortSignal): Promise<ExecutionState> {
+  throwIfAborted(signal);
   execution.tasks[task.id] = {
     ...execution.tasks[task.id],
     status: "running",
@@ -432,7 +559,7 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
   await updateRunState(run.repoPath, run.runId, { execution });
 
   const workerRun = await readRunState(run.repoPath, run.runId);
-  const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id]);
+  const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id], signal);
 
   if (response.should_wait) {
     if (response.wait_ms < task.waitPolicy.minMs || response.wait_ms > task.waitPolicy.maxMs) {
@@ -459,7 +586,7 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
       type: "task_wait_started",
       detail: `Task ${task.id} waiting ${response.wait_ms} ms.`,
     });
-    await sleep(response.wait_ms);
+    await sleep(response.wait_ms, signal);
     await appendRunEvent(run.repoPath, run.runId, {
       timestamp: new Date().toISOString(),
       type: "task_wait_finished",
@@ -490,15 +617,17 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
   return execution;
 }
 
-async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution: ExecutionState): Promise<ExecutionState> {
+async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution: ExecutionState, signal: AbortSignal): Promise<ExecutionState> {
+  throwIfAborted(signal);
   const checkIntervalMs = getLongRunningCheckIntervalMs(run, task);
   const originalState = execution.tasks[task.id];
 
   if (originalState.nextCheckAt) {
-    await waitForScheduledCheck(run, task, execution, originalState);
+    await waitForScheduledCheck(run, task, execution, originalState, signal);
   }
 
   while (true) {
+    throwIfAborted(signal);
     const currentTaskState = execution.tasks[task.id];
     execution.tasks[task.id] = {
       ...currentTaskState,
@@ -517,7 +646,7 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
     });
 
     const workerRun = await readRunState(run.repoPath, run.runId);
-    const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id]);
+    const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id], signal);
     const checkedAt = new Date().toISOString();
 
     if (response.completed) {
@@ -575,20 +704,22 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
       type: "task_check_scheduled",
       detail: `Task ${task.id} scheduled check iteration ${nextIteration} in ${checkIntervalMs} ms.`,
     });
-    await sleep(checkIntervalMs);
+    await sleep(checkIntervalMs, signal);
   }
 }
 
-async function executeTask(run: RunRecord, task: PlanTask, execution: ExecutionState): Promise<ExecutionState> {
+async function executeTask(run: RunRecord, task: PlanTask, execution: ExecutionState, signal: AbortSignal): Promise<ExecutionState> {
   if (task.taskMode === "long-running") {
-    return executeLongRunningTask(run, task, execution);
+    return executeLongRunningTask(run, task, execution, signal);
   }
-  return executeDefaultTask(run, task, execution);
+  return executeDefaultTask(run, task, execution, signal);
 }
 
 export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
   const plan = await readExecutionPlan(run.repoPath, run.runId);
   const executionOwnerId = crypto.randomUUID();
+  const executionController = new AbortController();
+  activeExecutionControllers.set(run.runId, executionController);
   const previousExecution = run.execution.taskOrder.length > 0 ? run.execution : null;
   const resumedExecution = buildResumableExecutionState(plan.tasks, previousExecution);
   const resumedTaskIds = Object.values(resumedExecution.tasks)
@@ -616,20 +747,24 @@ export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
     void refreshExecutionHeartbeat(run.repoPath, run.runId, executionOwnerId);
   }, EXECUTION_HEARTBEAT_INTERVAL_MS);
 
-  try {
-    let execution = resumedExecution;
-    let current = await readRunState(run.repoPath, run.runId);
+  let execution = resumedExecution;
+  let current = await readRunState(run.repoPath, run.runId);
 
+  try {
     const completed = new Set<string>(
       Object.values(execution.tasks)
         .filter((task) => task.status === "completed")
         .map((task) => task.taskId),
     );
     const started = new Set<string>();
-    const runningTasks = new Map<string, Promise<{ taskId: string; execution: ExecutionState }>>();
+    const runningTasks = new Map<string, Promise<
+      | { ok: true; taskId: string; execution: ExecutionState }
+      | { ok: false; taskId: string; error: unknown }
+    >>();
     const concurrency = Math.max(1, run.settings.maxAgentCount);
 
     while (completed.size < plan.tasks.length) {
+      throwIfAborted(executionController.signal);
       const readyTasks = plan.tasks.filter((task) => {
         if (completed.has(task.id) || started.has(task.id)) {
           return false;
@@ -644,10 +779,17 @@ export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
         }
         started.add(task.id);
         const executionRef = execution;
-        const promise = executeTask(current, task, executionRef).then((nextExecution) => ({
-          taskId: task.id,
-          execution: nextExecution,
-        }));
+        const promise = executeTask(current, task, executionRef, executionController.signal)
+          .then((nextExecution) => ({
+            ok: true as const,
+            taskId: task.id,
+            execution: nextExecution,
+          }))
+          .catch((error) => ({
+            ok: false as const,
+            taskId: task.id,
+            error,
+          }));
         runningTasks.set(task.id, promise);
       }
 
@@ -658,6 +800,9 @@ export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
       const result = await Promise.race(
         [...runningTasks.values()].map((promise) => promise.then((value) => value)),
       );
+      if (!result.ok) {
+        throw result.error;
+      }
       runningTasks.delete(result.taskId);
       completed.add(result.taskId);
       execution = result.execution;
@@ -672,14 +817,49 @@ export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
       },
     });
     return await refreshRunContext(run.repoPath, run.runId);
+  } catch (error) {
+    if (isTerminateTaskReason(executionController.signal.reason)) {
+      const reason = executionController.signal.reason;
+      const now = new Date().toISOString();
+      for (const taskState of Object.values(execution.tasks)) {
+        if (taskState.status === "running" || taskState.status === "waiting") {
+          const isTargetTask = taskState.taskId === reason.taskId;
+          execution.tasks[taskState.taskId] = {
+            ...taskState,
+            status: "failed",
+            currentAction: isTargetTask ? "terminated by operator" : `stopped after ${reason.taskId} was terminated`,
+            summary: isTargetTask ? reason.message : `Execution stopped after ${reason.taskId} was terminated by operator.`,
+            updatedAt: now,
+            waitUntil: undefined,
+            nextCheckAt: undefined,
+          };
+        }
+      }
+      await updateRunState(run.repoPath, run.runId, {
+        phase: "failed",
+        status: "error",
+        execution,
+      });
+      await refreshRunContext(run.repoPath, run.runId);
+      await appendRunEvent(run.repoPath, run.runId, {
+        timestamp: now,
+        type: "task_terminated",
+        detail: reason.message,
+      });
+      await appendRunNote(run.repoPath, run.runId, reason.message);
+    }
+    throw error;
   } finally {
+    activeExecutionControllers.delete(run.runId);
     clearInterval(heartbeatTimer);
   }
 }
 
 export async function freezeCurrentDraft(run: RunRecord): Promise<RunRecord> {
+  const currentRun = await readRunState(run.repoPath, run.runId);
   const draft = await readActiveDraft(run.repoPath, run.runId);
-  const missingFields = validateDraft(draft);
+  const readiness = evaluatePlannerReadiness(draft, currentRun.planner.planComplete);
+  const missingFields = readiness.missingFields;
   if (!draft || missingFields.length > 0) {
     throw new Error(`Draft cannot execute: ${missingFields.join(" ")}`);
   }
@@ -687,10 +867,10 @@ export async function freezeCurrentDraft(run: RunRecord): Promise<RunRecord> {
   const execution = buildInitialExecutionState(draft.tasks);
   const next = await updateRunState(run.repoPath, run.runId, {
     phase: "awaiting_execute_confirmation",
-    planner: {
-      ...run.planner,
-      canExecute: true,
-      missingFields: [],
+      planner: {
+        ...currentRun.planner,
+        canExecute: true,
+        missingFields: [],
       isStreaming: false,
     },
     execution,

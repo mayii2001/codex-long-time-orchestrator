@@ -180,8 +180,10 @@
       .settings-action {
         display: flex;
         align-items: end;
+        gap: 8px;
       }
-      #save-settings-button {
+      #save-settings-button,
+      #maintain-context-button {
         width: auto;
         min-width: 132px;
         white-space: nowrap;
@@ -316,6 +318,7 @@
               <input id="check-interval-ms" type="number" min="1" step="1" />
             </label>
             <div class="settings-action">
+              <button id="maintain-context-button">Maintain Context</button>
               <button id="save-settings-button">Save Settings</button>
             </div>
           </div>
@@ -342,7 +345,10 @@
         <div class="section process-section">
           <div class="section-header">
             <h2>Task Process</h2>
-            <button id="refresh-task-process-button" style="width:auto;">Refresh</button>
+            <div style="display:flex; gap:8px;">
+              <button id="terminate-task-button" style="width:auto;">Terminate Task</button>
+              <button id="refresh-task-process-button" style="width:auto;">Refresh</button>
+            </div>
           </div>
           <div class="detail-scroll">
             <pre id="task-process-json">Select a task to inspect its worker process.</pre>
@@ -372,7 +378,12 @@
       let loadedTurnCount = null;
       let loadedDraftVersion = null;
       let loadedEventCount = null;
+      let currentTurns = [];
+      let pendingUserMessage = "";
       let streamingMessage = "";
+      let settingsDirty = false;
+      let plannerStartedAt = 0;
+      let plannerStatusTimer = null;
 
       const projectListNode = document.getElementById("project-list");
       const runListNode = document.getElementById("run-list");
@@ -383,6 +394,7 @@
       const runSummaryNode = document.getElementById("run-summary");
       const taskListNode = document.getElementById("task-list");
       const taskProcessNode = document.getElementById("task-process-json");
+      const terminateTaskButton = document.getElementById("terminate-task-button");
       const refreshTaskProcessButton = document.getElementById("refresh-task-process-button");
       const messageInput = document.getElementById("message-input");
       const sendButton = document.getElementById("send-button");
@@ -394,6 +406,7 @@
       const taskModelNode = document.getElementById("task-model");
       const maxAgentCountNode = document.getElementById("max-agent-count");
       const checkIntervalNode = document.getElementById("check-interval-ms");
+      const maintainContextButton = document.getElementById("maintain-context-button");
       const saveSettingsButton = document.getElementById("save-settings-button");
 
       async function fetchJson(url, options) {
@@ -427,6 +440,41 @@
         if (activeProjectId) next.searchParams.set("projectId", activeProjectId);
         if (activeRunId) next.searchParams.set("runId", activeRunId);
         history.replaceState({}, "", next);
+      }
+
+      function formatElapsedSeconds(startedAt) {
+        if (!startedAt) return "0s";
+        const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+        return `${seconds}s`;
+      }
+
+      function stopPlannerStatusTimer() {
+        if (plannerStatusTimer) {
+          clearInterval(plannerStatusTimer);
+          plannerStatusTimer = null;
+        }
+        plannerStartedAt = 0;
+      }
+
+      function startPlannerStatusTimer() {
+        stopPlannerStatusTimer();
+        plannerStartedAt = Date.now();
+        streamStatusNode.textContent = `Main agent is thinking... ${formatElapsedSeconds(plannerStartedAt)}`;
+        plannerStatusTimer = setInterval(() => {
+          streamStatusNode.textContent = `Main agent is thinking... ${formatElapsedSeconds(plannerStartedAt)}`;
+        }, 1000);
+      }
+
+      function markSettingsDirty() {
+        settingsDirty = true;
+        if (!saveSettingsButton.disabled) {
+          saveSettingsButton.textContent = "Save Settings*";
+        }
+      }
+
+      function resetSettingsDirty() {
+        settingsDirty = false;
+        saveSettingsButton.textContent = "Save Settings";
       }
 
       function renderProjects(projects) {
@@ -471,8 +519,9 @@
       }
 
       function renderTurns(turns) {
+        currentTurns = turns;
         chatListNode.innerHTML = "";
-        if (!turns.length) {
+        if (!turns.length && !pendingUserMessage && !streamingMessage) {
           chatListNode.innerHTML = '<div class="section muted">No planner turns yet.</div>';
         } else {
           for (const turn of turns) {
@@ -487,12 +536,19 @@
             chatListNode.appendChild(assistant);
           }
         }
+        if (pendingUserMessage) {
+          const pendingUser = document.createElement("div");
+          pendingUser.className = "message user";
+          pendingUser.innerHTML = `<div class="muted">User</div><pre>${pendingUserMessage}</pre>`;
+          chatListNode.appendChild(pendingUser);
+        }
         if (streamingMessage) {
           const streaming = document.createElement("div");
           streaming.className = "message streaming";
-          streaming.innerHTML = `<div class="muted">Planner Stream</div><pre>${streamingMessage}</pre>`;
+          streaming.innerHTML = `<div class="muted">Main Agent</div><pre>${streamingMessage}</pre>`;
           chatListNode.appendChild(streaming);
         }
+        chatListNode.scrollTop = chatListNode.scrollHeight;
       }
 
       function renderRunSummary(run) {
@@ -506,15 +562,24 @@
           <div class="section"><div class="muted">Status</div><div class="summary-value">${run.status}</div></div>
           <div class="section"><div class="muted">Check Interval</div><div class="summary-value">${checkIntervalSeconds} s</div></div>
         `;
-        plannerModelNode.value = run.settings.plannerModel;
-        taskModelNode.value = run.settings.taskWorkerModel;
-        maxAgentCountNode.value = String(run.settings.maxAgentCount);
-        checkIntervalNode.value = String(checkIntervalSeconds);
+        if (!settingsDirty) {
+          plannerModelNode.value = run.settings.plannerModel;
+          taskModelNode.value = run.settings.taskWorkerModel;
+          maxAgentCountNode.value = String(run.settings.maxAgentCount);
+          checkIntervalNode.value = String(checkIntervalSeconds);
+        }
         const missing = run.planner.missingFields || [];
         freezeButton.disabled = missing.length > 0 || executionLive || run.planner.isStreaming;
         executeButton.disabled = !canResumeExecution;
         sendButton.disabled = run.planner.isStreaming;
         saveSettingsButton.disabled = executionLive || run.planner.isStreaming;
+        maintainContextButton.disabled = run.planner.isStreaming;
+        if (!saveSettingsButton.disabled) {
+          saveSettingsButton.textContent = settingsDirty ? "Save Settings*" : "Save Settings";
+        }
+        if (!maintainContextButton.disabled) {
+          maintainContextButton.textContent = "Maintain Context";
+        }
         if (executionLive) {
           executeHintNode.textContent = "Execution is in progress. You can keep chatting with the main agent for progress, but freezing and settings changes stay locked.";
         } else if ((run.phase === "executing" || run.phase === "waiting") && !executionLive) {
@@ -523,22 +588,28 @@
           executeHintNode.textContent = "Plan frozen. Ready to execute.";
         } else if (run.phase === "failed" && hasFrozenPlan) {
           executeHintNode.textContent = "Previous execution failed. You can update the plan or press Start Execute to rerun the saved plan.";
+        } else if (missing.includes("Planner has not marked the plan complete yet.")) {
+          executeHintNode.textContent = "The draft is structurally valid, but the main agent has not marked planning complete yet.";
         } else if (missing.length > 0) {
           executeHintNode.textContent = `Cannot execute yet: ${missing.join(" ")}`;
         } else {
           executeHintNode.textContent = "Plan looks complete. Freeze it to enable execution.";
         }
         streamStatusNode.textContent = run.planner.isStreaming ? "Planner is running..." : "";
+        const activeTask = activeTaskId ? run.execution?.tasks?.[activeTaskId] : null;
+        const canTerminateTask = Boolean(activeTask && (activeTask.status === "running" || activeTask.status === "waiting") && executionLive);
+        terminateTaskButton.disabled = !canTerminateTask;
       }
 
       function renderTasks(run) {
         taskListNode.innerHTML = "";
         const taskIds = run.execution.taskOrder || [];
         if (!taskIds.length) {
-          taskListNode.innerHTML = '<div class="muted">No tasks frozen yet.</div>';
-          taskProcessNode.textContent = "Select a task to inspect its worker process.";
-          return;
-        }
+        taskListNode.innerHTML = '<div class="muted">No tasks frozen yet.</div>';
+        taskProcessNode.textContent = "Select a task to inspect its worker process.";
+        terminateTaskButton.disabled = true;
+        return;
+      }
         if (!activeTaskId || !run.execution.tasks[activeTaskId]) {
           activeTaskId = taskIds[0] || null;
         }
@@ -607,6 +678,11 @@
         loadedTurnCount = null;
         loadedDraftVersion = null;
         loadedEventCount = null;
+        currentTurns = [];
+        pendingUserMessage = "";
+        resetSettingsDirty();
+        stopPlannerStatusTimer();
+        terminateTaskButton.disabled = true;
         draftNode.textContent = "No draft yet.";
         eventsNode.textContent = "[]";
         executeHintNode.textContent = "Select or create a run to continue.";
@@ -642,6 +718,9 @@
           taskProcessNode.textContent = "Select a task to inspect its worker process.";
           draftNode.textContent = "Loading...";
           eventsNode.textContent = "Loading...";
+          currentTurns = [];
+          pendingUserMessage = "";
+          resetSettingsDirty();
         }
         const run = await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}`);
         renderRunSummary(run);
@@ -692,19 +771,23 @@
             if (!line.startsWith("data: ")) continue;
             const event = JSON.parse(line.slice(6));
             if (event.type === "planner_started") {
-              streamStatusNode.textContent = "Planner started...";
+              streamStatusNode.textContent = `Main agent started... ${formatElapsedSeconds(plannerStartedAt)}`;
+            } else if (event.type === "planner_heartbeat") {
+              const seconds = Math.max(0, Math.floor((event.payload?.elapsedMs || 0) / 1000));
+              streamStatusNode.textContent = `Main agent is thinking... ${seconds}s`;
             } else if (event.type === "planner_event") {
               const payload = event.payload;
               if (payload?.type === "thread.started") {
-                streamStatusNode.textContent = "Planner thread started...";
+                streamStatusNode.textContent = `Main agent thread started... ${formatElapsedSeconds(plannerStartedAt)}`;
               } else if (payload?.type === "turn.started") {
-                streamStatusNode.textContent = "Planner turn started...";
+                streamStatusNode.textContent = `Main agent turn started... ${formatElapsedSeconds(plannerStartedAt)}`;
               } else if (payload?.type === "item.completed" && payload.item?.text) {
                 streamingMessage = payload.item.text;
                 renderTurns(await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/planner/turns`));
               }
             } else if (event.type === "planner_completed") {
               streamingMessage = event.payload.assistantMessage || "";
+              streamStatusNode.textContent = `Main agent replied in ${formatElapsedSeconds(plannerStartedAt)}.`;
             } else if (event.type === "error") {
               throw new Error(event.payload.message);
             }
@@ -724,14 +807,22 @@
         const message = messageInput.value.trim();
         if (!message || !activeRunId) return;
         sendButton.disabled = true;
+        pendingUserMessage = message;
+        streamingMessage = "Main agent is thinking...";
+        renderTurns(currentTurns);
+        messageInput.value = "";
+        startPlannerStatusTimer();
         try {
           await streamPlannerMessage(message);
-          messageInput.value = "";
+          pendingUserMessage = "";
           await loadAll();
         } catch (error) {
+          pendingUserMessage = "";
+          messageInput.value = message;
           alert(error.message);
         } finally {
           streamingMessage = "";
+          stopPlannerStatusTimer();
           await loadAll();
         }
       };
@@ -750,13 +841,38 @@
               checkIntervalMs: Number.parseFloat(checkIntervalNode.value) * 1000,
             }),
           });
+          resetSettingsDirty();
           await loadAll();
         } catch (error) {
           alert(error.message);
         } finally {
           saveSettingsButton.disabled = false;
+          saveSettingsButton.textContent = settingsDirty ? "Save Settings*" : "Save Settings";
         }
       };
+
+      maintainContextButton.onclick = async () => {
+        if (!activeRunId) return;
+        maintainContextButton.disabled = true;
+        maintainContextButton.textContent = "Maintaining...";
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/context/maintain`, {
+            method: "POST",
+          });
+          streamStatusNode.textContent = `Compressed context refreshed with task model ${taskModelNode.value}.`;
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          maintainContextButton.disabled = false;
+          maintainContextButton.textContent = "Maintain Context";
+        }
+      };
+
+      plannerModelNode.addEventListener("change", markSettingsDirty);
+      taskModelNode.addEventListener("change", markSettingsDirty);
+      maxAgentCountNode.addEventListener("input", markSettingsDirty);
+      checkIntervalNode.addEventListener("input", markSettingsDirty);
 
       freezeButton.onclick = async () => {
         if (!activeRunId) return;
@@ -815,6 +931,25 @@
 
       refreshTaskProcessButton.onclick = async () => {
         await loadTaskProcess();
+      };
+
+      terminateTaskButton.onclick = async () => {
+        if (!activeRunId || !activeTaskId) return;
+        if (!window.confirm(`Terminate task ${activeTaskId}? This stops the current execution for the run.`)) {
+          return;
+        }
+        terminateTaskButton.disabled = true;
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/tasks/${encodeURIComponent(activeTaskId)}/terminate`, {
+            method: "POST",
+          });
+          streamStatusNode.textContent = `Termination requested for task ${activeTaskId}.`;
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          await loadAll();
+        }
       };
 
       loadAll();

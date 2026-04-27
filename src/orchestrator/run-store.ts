@@ -193,6 +193,8 @@ export async function readRunState(repoPath: string, runId: string): Promise<Run
       turnCount: parsed.planner?.turnCount ?? 0,
       activeDraftVersion: parsed.planner?.activeDraftVersion ?? null,
       latestAssistantMessage: parsed.planner?.latestAssistantMessage ?? null,
+      sessionId: parsed.planner?.sessionId ?? null,
+      planComplete: parsed.planner?.planComplete ?? false,
       canExecute: parsed.planner?.canExecute ?? false,
       missingFields: parsed.planner?.missingFields ?? ["No plan draft yet."],
       isStreaming: parsed.planner?.isStreaming ?? false,
@@ -202,6 +204,9 @@ export async function readRunState(repoPath: string, runId: string): Promise<Run
       planSummary: parsed.context?.planSummary ?? null,
       executionSummary: parsed.context?.executionSummary ?? null,
       conversationSummary: parsed.context?.conversationSummary ?? null,
+      maintainedSummary: parsed.context?.maintainedSummary ?? null,
+      maintainedAt: parsed.context?.maintainedAt ?? null,
+      maintainedByModel: parsed.context?.maintainedByModel ?? null,
       plannerPrompt: parsed.context?.plannerPrompt ?? null,
     },
     execution: parsed.execution ?? {

@@ -116,6 +116,8 @@ function buildPlannerHeader(run: RunRecord, projectInstructions: string | null, 
   const executionLive = Boolean(run.runtime.executionOwnerId && run.runtime.executionHeartbeatAt);
   return [
     "You are the planner model inside Codex Agent Orchestrator.",
+    "Return JSON only.",
+    "The JSON object must contain exactly these top-level keys: assistant_response, plan_complete, plan_update.",
     "Behave like a normal helpful Codex planner in tone.",
     "Respond to the user naturally in assistant_response.",
     executionLive
@@ -124,7 +126,12 @@ function buildPlannerHeader(run: RunRecord, projectInstructions: string | null, 
     executionLive
       ? "While execution is active, always set plan_update to null and do not attempt to revise the plan."
       : "Only set plan_update when the current plan materially changed.",
+    executionLive
+      ? "While execution is active, always set plan_complete to false."
+      : "Set plan_complete to true only when the current plan is complete and ready to freeze for execution.",
+    "If the current plan is already complete and unchanged, keep plan_complete true even when plan_update is null.",
     "If nothing changed in the plan, set plan_update to null.",
+    "If the plan still needs clarification, decomposition, or revision, set plan_complete to false.",
     "When you emit plan_update, it must be a complete plan snapshot, not a partial diff.",
     "A valid task must include: id, title, depends_on, worker_prompt, wait_range_ms.min, wait_range_ms.max.",
     "You may optionally set task_mode to long-running when the task launches or supervises a long-running external job.",
@@ -141,6 +148,7 @@ function buildPlannerHeader(run: RunRecord, projectInstructions: string | null, 
     `Goal checkpoint: ${context.goalSummary || "-"}`,
     `Plan checkpoint: ${context.planSummary || "-"}`,
     `Execution checkpoint: ${context.executionSummary || "-"}`,
+    `Maintained compressed context: ${context.maintainedSummary || "-"}`,
     "Project instructions:",
     projectInstructions || "- none",
     "Execution task snapshot:",
@@ -159,6 +167,9 @@ export function buildRunContextState(
     planSummary: summarizePlan(draft),
     executionSummary: summarizeExecution(run),
     conversationSummary: summarizeConversation(turns),
+    maintainedSummary: run.context?.maintainedSummary ?? null,
+    maintainedAt: run.context?.maintainedAt ?? null,
+    maintainedByModel: run.context?.maintainedByModel ?? null,
     plannerPrompt,
   };
 }
@@ -268,6 +279,7 @@ export function assembleTaskPrompt(args: {
     `Goal checkpoint: ${context.goalSummary || "-"}`,
     `Plan checkpoint: ${context.planSummary || "-"}`,
     `Execution checkpoint: ${context.executionSummary || "-"}`,
+    `Maintained compressed context: ${context.maintainedSummary || "-"}`,
     "Project instructions:",
     args.projectInstructions || "- none",
   ];

@@ -32,7 +32,7 @@ When you send a message in the web UI, the host loads the saved run context and 
 
 That design gives three useful properties. First, the run history is stored on disk. Second, refreshing the browser does not lose execution state. Third, if the host process is interrupted, the system can decide whether to resume planning, continue execution, or start the next cycle from the saved state.
 
-In the current implementation, the main agent and task workers no longer share the same context strategy. The main agent no longer runs in one-shot ephemeral mode. Instead, it relies on host-managed run checkpoints so long-lived work keeps a more stable sense of goal and plan. Task workers stay short-lived, but for long-running tasks the host now injects execution checkpoints and deltas since the previous wake instead of forcing each wake-up to reconstruct context from loose history.
+In the current implementation, the main agent and task workers no longer share the same context strategy. The main agent no longer runs in one-shot ephemeral mode. Instead, each run keeps a durable Codex planner session and later planner turns prefer `codex exec resume` so the same session can continue. Task workers stay short-lived, but for long-running tasks the host now injects execution checkpoints and deltas since the previous wake instead of forcing each wake-up to reconstruct context from loose history.
 
 ## Installation and First Start
 
@@ -89,6 +89,8 @@ In normal use, the flow is simple. Run `orch plan` inside a project, then talk t
 Once the draft is complete, click `Freeze Plan` to turn it into an execution plan. Then click `Start Execute` to hand the work to the background executor. The browser will keep showing run status, task status, events, waiting periods, and recent worker output. For long-running tasks, you can also configure a check interval so the system wakes the model again after a period of time instead of stopping after one wait.
 
 The run history in the left sidebar prefers the topic from the first planning message for each run. That makes repeated attempts inside the same project easier to scan by intent instead of forcing you to recognize runs only by UUID.
+
+If a task is already running or waiting and you know the current attempt should stop, the `Task Process` panel can terminate the selected task explicitly. That interrupts the current run execution and writes the operator stop reason back into task state and event history so the next planning or rerun step starts from an honest state.
 
 If execution is interrupted, completed tasks remain recorded. The next time you open the run, you can continue planning or resume execution from the unfinished part.
 

@@ -94,6 +94,8 @@ export interface PlannerState {
   turnCount: number;
   activeDraftVersion: number | null;
   latestAssistantMessage: string | null;
+  sessionId: string | null;
+  planComplete: boolean;
   canExecute: boolean;
   missingFields: string[];
   isStreaming: boolean;
@@ -111,6 +113,9 @@ export interface RunContextState {
   planSummary: string | null;
   executionSummary: string | null;
   conversationSummary: string | null;
+  maintainedSummary: string | null;
+  maintainedAt: string | null;
+  maintainedByModel: string | null;
   plannerPrompt: PlannerPromptContextMeta | null;
 }
 
@@ -168,6 +173,7 @@ export interface RunRecord {
 
 export interface PlannerResponseEnvelope {
   assistant_response: string;
+  plan_complete: boolean;
   plan_update: null | {
     summary: string;
     tasks: Array<{

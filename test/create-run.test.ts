@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { executeFrozenPlan, freezeCurrentDraft, submitPlannerMessage } from "../src/orchestrator/planner-runner.js";
+import { executeFrozenPlan, freezeCurrentDraft, maintainCompressedContext, submitPlannerMessage } from "../src/orchestrator/planner-runner.js";
 import { startAppServer } from "../src/server/http-server.js";
 import {
   getEventsPath,
@@ -50,6 +50,7 @@ test("planner message updates draft, freezes, and executes task", async () => {
   const afterMessage = await submitPlannerMessage(record, "Build a plan for a short wait task.");
   const draft = await readActiveDraft(repoPath, record.runId);
   assert.equal(afterMessage.planner.turnCount, 1);
+  assert.equal(afterMessage.planner.planComplete, true);
   assert.equal(afterMessage.planner.canExecute, true);
   assert.match(afterMessage.context.goalSummary || "", /Build a plan/);
   assert.match(afterMessage.context.planSummary || "", /Execute one task/);
@@ -87,6 +88,95 @@ test("planner main agent runs without ephemeral mode", async () => {
   assert.equal(next.planner.turnCount, 1);
   assert.equal(turns[0]?.assistantMessage, "planner persistence: durable");
   assert.equal(turns[0]?.worker.ephemeral, false);
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner stores and resumes a persistent session id", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-planner-session-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const first = await submitPlannerMessage(record, "Build a plan for a short wait task.");
+  assert.equal(first.planner.sessionId, "mock-thread-1");
+
+  const second = await submitPlannerMessage(first, "Verify planner session resume.");
+  const turns = await listPlannerTurns(repoPath, record.runId);
+
+  assert.equal(second.planner.sessionId, "mock-thread-1");
+  assert.equal(turns[1]?.assistantMessage, "planner session resume: mock-thread-1");
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner cannot freeze a draft before plan completion is marked", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-plan-complete-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const planned = await submitPlannerMessage(record, "Build a plan that is still under discussion.");
+
+  assert.equal(planned.planner.planComplete, false);
+  assert.equal(planned.planner.canExecute, false);
+  assert.match(planned.planner.missingFields.join(" "), /plan complete/);
+  await assert.rejects(
+    freezeCurrentDraft(planned),
+    /Planner has not marked the plan complete yet/,
+  );
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("retryable codex api failures stop after five attempts", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-api-retry-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  const retryFile = path.join(homePath, "retry-count.txt");
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+  process.env.ORCH_MOCK_RETRY_FILE = retryFile;
+
+  const record = await createRunScaffold({ repoPath });
+  await assert.rejects(
+    submitPlannerMessage(record, "Force planner API reconnect failure for test."),
+    /Codex API retry\/reconnect failed 5 times/,
+  );
+
+  const attempts = await fs.readFile(retryFile, "utf8");
+  assert.equal(attempts.trim(), "5");
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+  delete process.env.ORCH_MOCK_RETRY_FILE;
+});
+
+test("single worker call is aborted after five internal api reconnect signals", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-api-ceiling-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const startedAt = Date.now();
+  await assert.rejects(
+    submitPlannerMessage(record, "Force internal API reconnect loop for test."),
+    /Codex API retry ceiling reached after 5 reconnect attempts/,
+  );
+  assert.ok(Date.now() - startedAt < 5_000);
 
   delete process.env.ORCH_HOME;
   delete process.env.ORCH_CODEX_BIN;
@@ -143,6 +233,115 @@ test("execute endpoint returns immediately and runs in background", async () => 
   delete process.env.ORCH_CODEX_ARGS;
 });
 
+test("terminate task endpoint stops an active waiting task", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-terminate-task-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const afterMessage = await submitPlannerMessage(record, "Build a plan for task termination.");
+  await freezeCurrentDraft(afterMessage);
+
+  const server = await startAppServer(0);
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const executeResponse = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(record.runId)}/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "execute" }),
+  });
+  assert.equal(executeResponse.status, 202);
+
+  let waitingState = await readRunState(repoPath, record.runId);
+  const waitingDeadline = Date.now() + 2_000;
+  while (waitingState.execution.tasks["task-1"]?.status !== "waiting" && Date.now() < waitingDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    waitingState = await readRunState(repoPath, record.runId);
+  }
+  assert.equal(waitingState.execution.tasks["task-1"]?.status, "waiting");
+
+  const terminateResponse = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(record.runId)}/tasks/task-1/terminate`, {
+    method: "POST",
+  });
+  const terminatePayload = await terminateResponse.json();
+  assert.equal(terminateResponse.status, 202);
+  assert.equal(terminatePayload.execution.tasks["task-1"].status, "waiting");
+
+  let finalState = await readRunState(repoPath, record.runId);
+  const finalDeadline = Date.now() + 2_000;
+  while (finalState.execution.tasks["task-1"]?.status !== "failed" && Date.now() < finalDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    finalState = await readRunState(repoPath, record.runId);
+  }
+
+  assert.equal(finalState.phase, "failed");
+  assert.equal(finalState.status, "error");
+  assert.equal(finalState.execution.tasks["task-1"].status, "failed");
+  assert.equal(finalState.execution.tasks["task-1"].currentAction, "terminated by operator");
+  assert.match(finalState.execution.tasks["task-1"].summary || "", /terminated by operator/);
+
+  const events = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");
+  assert.match(events, /task_termination_requested/);
+  assert.match(events, /task_terminated/);
+
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner stream emits heartbeat while main agent is still working", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-stream-heartbeat-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const server = await startAppServer(0);
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const response = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(record.runId)}/planner/message/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Delay planner response for heartbeat test." }),
+  });
+  const streamText = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(streamText, /"type":"planner_started"/);
+  assert.match(streamText, /"type":"planner_heartbeat"/);
+  assert.match(streamText, /"type":"done"/);
+
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
 test("settings endpoint persists check interval", async () => {
   const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-settings-"));
   const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
@@ -179,6 +378,33 @@ test("settings endpoint persists check interval", async () => {
   });
 
   delete process.env.ORCH_HOME;
+});
+
+test("maintain compressed context uses task model and updates run context", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-context-maintain-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  await updateRunState(repoPath, record.runId, {
+    settings: {
+      ...record.settings,
+      taskWorkerModel: "gpt-5.4",
+    },
+  });
+  const configured = await readRunState(repoPath, record.runId);
+  const planned = await submitPlannerMessage(configured, "Build a plan for a short wait task.");
+  const maintained = await maintainCompressedContext(planned);
+
+  assert.match(maintained.context.maintainedSummary || "", /Maintained context checkpoint/);
+  assert.equal(maintained.context.maintainedByModel, "gpt-5.4");
+  assert.ok(maintained.context.maintainedAt);
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
 });
 
 test("long-running task uses check interval and re-wakes the worker", async () => {
