@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex Agent Orchestrator</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Arial, Helvetica, sans-serif;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: #0f172a;
+        color: #e2e8f0;
+        overflow: hidden;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 280px 1fr 440px;
+        height: 100vh;
+        overflow: hidden;
+      }
+      .sidebar,
+      .panel,
+      .detail {
+        border-right: 1px solid #334155;
+        padding: 16px;
+        box-sizing: border-box;
+        min-height: 0;
+      }
+      .sidebar,
+      .detail {
+        background: #111827;
+      }
+      .sidebar {
+        overflow: auto;
+      }
+      .panel {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+      .detail {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+      .section {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 12px;
+        min-height: 0;
+      }
+      .detail .section {
+        display: flex;
+        flex-direction: column;
+      }
+      .detail-scroll {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+      }
+      .detail .section.tasks-section {
+        flex: 0.95;
+      }
+      .detail .section.process-section {
+        flex: 1.25;
+      }
+      .detail .section.draft-section,
+      .detail .section.events-section {
+        flex: 0.85;
+      }
+      .project-list,
+      .run-list,
+      .chat-list,
+      .task-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .chat-list {
+        flex: 1;
+        overflow: auto;
+      }
+      .list-button,
+      button,
+      select,
+      input {
+        border: 1px solid #475569;
+        background: #0f172a;
+        color: #e2e8f0;
+        border-radius: 8px;
+        padding: 10px 12px;
+        box-sizing: border-box;
+      }
+      .list-button,
+      button {
+        width: 100%;
+        text-align: left;
+        cursor: pointer;
+      }
+      .list-button.active {
+        border-color: #38bdf8;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      textarea {
+        width: 100%;
+        min-height: 100px;
+        background: #0f172a;
+        color: #e2e8f0;
+        border: 1px solid #475569;
+        border-radius: 8px;
+        padding: 12px;
+        box-sizing: border-box;
+      }
+      .message {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 12px;
+      }
+      .message.user { border-color: #2563eb; }
+      .message.assistant { border-color: #16a34a; }
+      .message.streaming { border-color: #f59e0b; }
+      .muted { color: #94a3b8; }
+      .toolbar {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+      .section-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .run-actions {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 8px;
+        align-items: center;
+      }
+      .grid-2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .grid-3 {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+      .task {
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 10px;
+        cursor: pointer;
+      }
+      .task.active { border-color: #f8fafc; }
+      .task.running { border-color: #38bdf8; }
+      .task.waiting { border-color: #f59e0b; }
+      .task.completed { border-color: #22c55e; }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      h1, h2, h3 { margin: 0 0 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <h2>Projects</h2>
+        <div id="project-list" class="project-list"></div>
+        <h3 style="margin-top: 16px;">Runs</h3>
+        <div class="run-actions" style="margin-bottom: 8px;">
+          <div class="muted">Current project history</div>
+          <button id="delete-run-button" style="width:auto;">Delete</button>
+        </div>
+        <div id="run-list" class="run-list"></div>
+      </aside>
+      <main class="panel">
+        <div class="section">
+          <h1>Planner</h1>
+          <div id="run-summary" class="grid-3"></div>
+        </div>
+        <div class="section">
+          <h2>Settings</h2>
+          <div class="grid-2">
+            <label>
+              <div class="muted">Planner Model</div>
+              <select id="planner-model">
+                <option>gpt-5.4-mini</option>
+                <option>gpt-5.4</option>
+                <option>gpt-5.5</option>
+                <option>gpt-5.2</option>
+              </select>
+            </label>
+            <label>
+              <div class="muted">Task Model</div>
+              <select id="task-model">
+                <option>gpt-5.4-mini</option>
+                <option>gpt-5.4</option>
+                <option>gpt-5.5</option>
+                <option>gpt-5.2</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid-3" style="margin-top: 8px;">
+            <label>
+              <div class="muted">Max Agent Num</div>
+              <input id="max-agent-count" type="number" min="1" step="1" />
+            </label>
+            <label>
+              <div class="muted">Check Interval Sec</div>
+              <input id="check-interval-ms" type="number" min="1" step="1" />
+            </label>
+            <div style="display:flex;align-items:end;">
+              <button id="save-settings-button">Save Settings</button>
+            </div>
+          </div>
+        </div>
+        <div id="chat-list" class="chat-list"></div>
+        <div class="section">
+          <textarea id="message-input" placeholder="Talk to planner. Press Enter to send, Shift+Enter for newline."></textarea>
+          <div class="toolbar" style="margin-top: 10px;">
+            <button id="send-button">Send</button>
+            <button id="freeze-button">Freeze Plan</button>
+            <button id="execute-button">Start Execute</button>
+          </div>
+          <div id="execute-hint" class="muted" style="margin-top: 10px;"></div>
+          <div id="stream-status" class="muted" style="margin-top: 8px;"></div>
+        </div>
+      </main>
+      <aside class="detail">
+        <div class="section tasks-section">
+          <h2>Tasks</h2>
+          <div class="detail-scroll">
+            <div id="task-list" class="task-list"></div>
+          </div>
+        </div>
+        <div class="section process-section">
+          <div class="section-header">
+            <h2>Task Process</h2>
+            <button id="refresh-task-process-button" style="width:auto;">Refresh</button>
+          </div>
+          <div class="detail-scroll">
+            <pre id="task-process-json">Select a task to inspect its worker process.</pre>
+          </div>
+        </div>
+        <div class="section draft-section">
+          <h2>Draft</h2>
+          <div class="detail-scroll">
+            <pre id="draft-json">No draft yet.</pre>
+          </div>
+        </div>
+        <div class="section events-section">
+          <h2>Events</h2>
+          <div class="detail-scroll">
+            <pre id="events-json">Loading...</pre>
+          </div>
+        </div>
+      </aside>
+    </div>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      let activeProjectId = params.get("projectId");
+      let activeRunId = params.get("runId");
+      let activeTaskId = null;
+      let loadedRunId = null;
+      let loadedTaskProcessKey = null;
+      let loadedTurnCount = null;
+      let loadedDraftVersion = null;
+      let loadedEventCount = null;
+      let streamingMessage = "";
+
+      const projectListNode = document.getElementById("project-list");
+      const runListNode = document.getElementById("run-list");
+      const deleteRunButton = document.getElementById("delete-run-button");
+      const chatListNode = document.getElementById("chat-list");
+      const draftNode = document.getElementById("draft-json");
+      const eventsNode = document.getElementById("events-json");
+      const runSummaryNode = document.getElementById("run-summary");
+      const taskListNode = document.getElementById("task-list");
+      const taskProcessNode = document.getElementById("task-process-json");
+      const refreshTaskProcessButton = document.getElementById("refresh-task-process-button");
+      const messageInput = document.getElementById("message-input");
+      const sendButton = document.getElementById("send-button");
+      const freezeButton = document.getElementById("freeze-button");
+      const executeButton = document.getElementById("execute-button");
+      const executeHintNode = document.getElementById("execute-hint");
+      const streamStatusNode = document.getElementById("stream-status");
+      const plannerModelNode = document.getElementById("planner-model");
+      const taskModelNode = document.getElementById("task-model");
+      const maxAgentCountNode = document.getElementById("max-agent-count");
+      const checkIntervalNode = document.getElementById("check-interval-ms");
+      const saveSettingsButton = document.getElementById("save-settings-button");
+
+      async function fetchJson(url, options) {
+        const response = await fetch(url, options);
+        const raw = await response.text();
+        const contentType = response.headers.get("content-type") || "";
+        const data = contentType.includes("application/json")
+          ? JSON.parse(raw || "{}")
+          : { error: raw || `Request failed: ${response.status}` };
+        if (!response.ok) {
+          throw new Error(data.error || `Request failed: ${response.status}`);
+        }
+        return data;
+      }
+
+      function isExecutionLive(run) {
+        const ownerId = run.runtime?.executionOwnerId;
+        const heartbeatAt = run.runtime?.executionHeartbeatAt;
+        if (!ownerId || !heartbeatAt) {
+          return false;
+        }
+        const heartbeatTime = new Date(heartbeatAt).getTime();
+        if (Number.isNaN(heartbeatTime)) {
+          return false;
+        }
+        return Date.now() - heartbeatTime <= 15000;
+      }
+
+      function updateLocation() {
+        const next = new URL(window.location.href);
+        if (activeProjectId) next.searchParams.set("projectId", activeProjectId);
+        if (activeRunId) next.searchParams.set("runId", activeRunId);
+        history.replaceState({}, "", next);
+      }
+
+      function renderProjects(projects) {
+        projectListNode.innerHTML = "";
+        for (const project of projects) {
+          const button = document.createElement("button");
+          button.className = "list-button" + (project.projectId === activeProjectId ? " active" : "");
+          button.textContent = `${project.displayName}\n${project.repoPath}`;
+          button.onclick = () => {
+            activeProjectId = project.projectId;
+            activeRunId = project.runIds[project.runIds.length - 1] || null;
+            updateLocation();
+            loadAll();
+          };
+          projectListNode.appendChild(button);
+        }
+      }
+
+      function renderRuns(project) {
+        runListNode.innerHTML = "";
+        if (!project) return;
+        for (const runId of [...project.runIds].reverse()) {
+          const button = document.createElement("button");
+          button.className = "list-button" + (runId === activeRunId ? " active" : "");
+          button.textContent = runId;
+          button.onclick = () => {
+            activeRunId = runId;
+            updateLocation();
+            loadAll();
+          };
+          runListNode.appendChild(button);
+        }
+      }
+
+      function renderTurns(turns) {
+        chatListNode.innerHTML = "";
+        if (!turns.length) {
+          chatListNode.innerHTML = '<div class="section muted">No planner turns yet.</div>';
+        } else {
+          for (const turn of turns) {
+            const user = document.createElement("div");
+            user.className = "message user";
+            user.innerHTML = `<div class="muted">User</div><pre>${turn.userMessage}</pre>`;
+            chatListNode.appendChild(user);
+
+            const assistant = document.createElement("div");
+            assistant.className = "message assistant";
+            assistant.innerHTML = `<div class="muted">Planner</div><pre>${turn.assistantMessage}</pre>`;
+            chatListNode.appendChild(assistant);
+          }
+        }
+        if (streamingMessage) {
+          const streaming = document.createElement("div");
+          streaming.className = "message streaming";
+          streaming.innerHTML = `<div class="muted">Planner Stream</div><pre>${streamingMessage}</pre>`;
+          chatListNode.appendChild(streaming);
+        }
+      }
+
+      function renderRunSummary(run) {
+        const executionLive = isExecutionLive(run);
+        const hasFrozenPlan = (run.execution?.taskOrder || []).length > 0;
+        const canResumeExecution = hasFrozenPlan && !executionLive && run.phase !== "completed" && run.phase !== "cancelled";
+        const checkIntervalSeconds = run.settings.checkIntervalMs / 1000;
+        runSummaryNode.innerHTML = `
+          <div class="section"><div class="muted">Run ID</div><div>${run.runId}</div></div>
+          <div class="section"><div class="muted">Phase</div><div>${run.phase}</div></div>
+          <div class="section"><div class="muted">Status</div><div>${run.status}</div></div>
+          <div class="section"><div class="muted">Check Interval</div><div>${checkIntervalSeconds} s</div></div>
+        `;
+        plannerModelNode.value = run.settings.plannerModel;
+        taskModelNode.value = run.settings.taskWorkerModel;
+        maxAgentCountNode.value = String(run.settings.maxAgentCount);
+        checkIntervalNode.value = String(checkIntervalSeconds);
+        const missing = run.planner.missingFields || [];
+        freezeButton.disabled = missing.length > 0 || executionLive || run.planner.isStreaming;
+        executeButton.disabled = !canResumeExecution;
+        sendButton.disabled = run.planner.isStreaming;
+        saveSettingsButton.disabled = executionLive || run.planner.isStreaming;
+        if (executionLive) {
+          executeHintNode.textContent = "Execution is in progress. You can keep chatting with the main agent for progress, but freezing and settings changes stay locked.";
+        } else if ((run.phase === "executing" || run.phase === "waiting") && !executionLive) {
+          executeHintNode.textContent = "Previous execution appears interrupted. You can continue planning or press Start Execute to resume from the saved plan.";
+        } else if (run.phase === "awaiting_execute_confirmation") {
+          executeHintNode.textContent = "Plan frozen. Ready to execute.";
+        } else if (run.phase === "failed" && hasFrozenPlan) {
+          executeHintNode.textContent = "Previous execution failed. You can update the plan or press Start Execute to rerun the saved plan.";
+        } else if (missing.length > 0) {
+          executeHintNode.textContent = `Cannot execute yet: ${missing.join(" ")}`;
+        } else {
+          executeHintNode.textContent = "Plan looks complete. Freeze it to enable execution.";
+        }
+        streamStatusNode.textContent = run.planner.isStreaming ? "Planner is running..." : "";
+      }
+
+      function renderTasks(run) {
+        taskListNode.innerHTML = "";
+        const taskIds = run.execution.taskOrder || [];
+        if (!taskIds.length) {
+          taskListNode.innerHTML = '<div class="muted">No tasks frozen yet.</div>';
+          taskProcessNode.textContent = "Select a task to inspect its worker process.";
+          return;
+        }
+        if (!activeTaskId || !run.execution.tasks[activeTaskId]) {
+          activeTaskId = taskIds[0] || null;
+        }
+        for (const taskId of taskIds) {
+          const task = run.execution.tasks[taskId];
+          const div = document.createElement("div");
+          div.className = `task ${task.status}${taskId === activeTaskId ? " active" : ""}`;
+          let waitLine = "";
+          if ((task.status === "waiting" || task.nextCheckAt) && task.waitUntil) {
+            const remaining = Math.max(0, new Date(task.waitUntil).getTime() - Date.now());
+            waitLine = `Remaining wait: ${Math.ceil(remaining / 1000)} s`;
+          }
+          const nextCheckLine = task.nextCheckAt ? `Next check: ${task.nextCheckAt}` : "";
+          const iterationLine = task.taskMode === "long-running" ? `Check iteration: ${task.checkIteration ?? 0}` : "";
+          div.innerHTML = `
+            <div><strong>${task.title}</strong></div>
+            <div class="muted">Task ID: ${task.taskId}</div>
+            <div class="muted">Mode: ${task.taskMode || "default"}</div>
+            <div class="muted">Status: ${task.status}</div>
+            <div class="muted">Model: ${task.model || "-"}</div>
+            <div class="muted">Action: ${task.currentAction || "-"}</div>
+            <div class="muted">${waitLine}</div>
+            <div class="muted">${nextCheckLine}</div>
+            <div class="muted">${iterationLine}</div>
+            <div>${task.summary || ""}</div>
+          `;
+          div.onclick = async () => {
+            activeTaskId = taskId;
+            renderTasks(run);
+            await loadTaskProcess();
+          };
+          taskListNode.appendChild(div);
+        }
+      }
+
+      async function loadTaskProcess() {
+        if (!activeRunId || !activeTaskId) {
+          taskProcessNode.textContent = "Select a task to inspect its worker process.";
+          loadedTaskProcessKey = null;
+          return;
+        }
+        refreshTaskProcessButton.disabled = true;
+        try {
+          const detail = await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/tasks/${encodeURIComponent(activeTaskId)}`);
+          taskProcessNode.textContent = JSON.stringify(detail, null, 2);
+          loadedTaskProcessKey = `${activeRunId}:${activeTaskId}`;
+        } catch (error) {
+          taskProcessNode.textContent = error.message;
+          loadedTaskProcessKey = null;
+        } finally {
+          refreshTaskProcessButton.disabled = false;
+        }
+      }
+
+      function renderEmptyRunState() {
+        runSummaryNode.innerHTML = `
+          <div class="section"><div class="muted">Run ID</div><div>-</div></div>
+          <div class="section"><div class="muted">Phase</div><div>-</div></div>
+          <div class="section"><div class="muted">Status</div><div>-</div></div>
+        `;
+        chatListNode.innerHTML = '<div class="section muted">No run selected.</div>';
+        taskListNode.innerHTML = '<div class="muted">No tasks to show.</div>';
+        taskProcessNode.textContent = "Select a task to inspect its worker process.";
+        loadedRunId = null;
+        loadedTaskProcessKey = null;
+        loadedTurnCount = null;
+        loadedDraftVersion = null;
+        loadedEventCount = null;
+        draftNode.textContent = "No draft yet.";
+        eventsNode.textContent = "[]";
+        executeHintNode.textContent = "Select or create a run to continue.";
+        streamStatusNode.textContent = "";
+      }
+
+      async function loadAll() {
+        const projects = await fetchJson("/api/projects");
+        renderProjects(projects);
+        const activeProject = projects.find((project) => project.projectId === activeProjectId) || projects[0] || null;
+        if (activeProject && !activeProjectId) activeProjectId = activeProject.projectId;
+        renderRuns(activeProject);
+        if (!activeRunId && activeProject && activeProject.runIds.length) {
+          activeRunId = activeProject.runIds[activeProject.runIds.length - 1];
+        }
+        if (activeProject && activeRunId && !activeProject.runIds.includes(activeRunId)) {
+          activeRunId = activeProject.runIds[activeProject.runIds.length - 1] || null;
+        }
+        deleteRunButton.disabled = !activeRunId;
+        updateLocation();
+        if (!activeRunId) {
+          activeTaskId = null;
+          renderEmptyRunState();
+          return;
+        }
+        if (loadedRunId !== activeRunId) {
+          activeTaskId = null;
+          loadedRunId = activeRunId;
+          loadedTaskProcessKey = null;
+          loadedTurnCount = null;
+          loadedDraftVersion = null;
+          loadedEventCount = null;
+          taskProcessNode.textContent = "Select a task to inspect its worker process.";
+          draftNode.textContent = "Loading...";
+          eventsNode.textContent = "Loading...";
+        }
+        const run = await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}`);
+        renderRunSummary(run);
+        renderTasks(run);
+        if (loadedTurnCount !== run.planner.turnCount) {
+          const turns = await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/planner/turns`);
+          renderTurns(turns);
+          loadedTurnCount = run.planner.turnCount;
+        }
+        if (loadedDraftVersion !== run.planner.activeDraftVersion) {
+          const draft = await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/planner/draft`);
+          draftNode.textContent = draft ? JSON.stringify(draft, null, 2) : "No draft yet.";
+          loadedDraftVersion = run.planner.activeDraftVersion;
+        }
+        if (loadedEventCount !== run.eventCount) {
+          const events = await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/events`);
+          eventsNode.textContent = JSON.stringify(events, null, 2);
+          loadedEventCount = run.eventCount;
+        }
+        const currentTaskProcessKey = activeTaskId ? `${activeRunId}:${activeTaskId}` : null;
+        if (currentTaskProcessKey && currentTaskProcessKey !== loadedTaskProcessKey) {
+          await loadTaskProcess();
+        }
+      }
+
+      async function streamPlannerMessage(message) {
+        const response = await fetch(`/api/runs/${encodeURIComponent(activeRunId)}/planner/message/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        });
+        if (!response.ok || !response.body) {
+          const maybeJson = await response.json().catch(() => null);
+          throw new Error(maybeJson?.error || "Stream request failed");
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        streamingMessage = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+          for (const frame of frames) {
+            const line = frame.trim();
+            if (!line.startsWith("data: ")) continue;
+            const event = JSON.parse(line.slice(6));
+            if (event.type === "planner_started") {
+              streamStatusNode.textContent = "Planner started...";
+            } else if (event.type === "planner_event") {
+              const payload = event.payload;
+              if (payload?.type === "thread.started") {
+                streamStatusNode.textContent = "Planner thread started...";
+              } else if (payload?.type === "turn.started") {
+                streamStatusNode.textContent = "Planner turn started...";
+              } else if (payload?.type === "item.completed" && payload.item?.text) {
+                streamingMessage = payload.item.text;
+                renderTurns(await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/planner/turns`));
+              }
+            } else if (event.type === "planner_completed") {
+              streamingMessage = event.payload.assistantMessage || "";
+            } else if (event.type === "error") {
+              throw new Error(event.payload.message);
+            }
+          }
+        }
+        streamingMessage = "";
+      }
+
+      messageInput.addEventListener("keydown", async (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          sendButton.click();
+        }
+      });
+
+      sendButton.onclick = async () => {
+        const message = messageInput.value.trim();
+        if (!message || !activeRunId) return;
+        sendButton.disabled = true;
+        try {
+          await streamPlannerMessage(message);
+          messageInput.value = "";
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          streamingMessage = "";
+          await loadAll();
+        }
+      };
+
+      saveSettingsButton.onclick = async () => {
+        if (!activeRunId) return;
+        saveSettingsButton.disabled = true;
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/settings`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              plannerModel: plannerModelNode.value,
+              taskWorkerModel: taskModelNode.value,
+              maxAgentCount: Number.parseInt(maxAgentCountNode.value, 10),
+              checkIntervalMs: Number.parseFloat(checkIntervalNode.value) * 1000,
+            }),
+          });
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          saveSettingsButton.disabled = false;
+        }
+      };
+
+      freezeButton.onclick = async () => {
+        if (!activeRunId) return;
+        freezeButton.disabled = true;
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/execute`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "freeze" }),
+          });
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          freezeButton.disabled = false;
+        }
+      };
+
+      executeButton.onclick = async () => {
+        if (!activeRunId) return;
+        executeButton.disabled = true;
+        executeHintNode.textContent = "Execution is starting...";
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/execute`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "execute" }),
+          });
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          executeButton.disabled = false;
+        }
+      };
+
+      deleteRunButton.onclick = async () => {
+        if (!activeRunId) return;
+        const runIdToDelete = activeRunId;
+        if (!window.confirm(`Delete run ${runIdToDelete}? This removes its saved state from disk.`)) {
+          return;
+        }
+        deleteRunButton.disabled = true;
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(runIdToDelete)}`, {
+            method: "DELETE",
+          });
+          activeRunId = null;
+          await loadAll();
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          deleteRunButton.disabled = false;
+        }
+      };
+
+      refreshTaskProcessButton.onclick = async () => {
+        await loadTaskProcess();
+      };
+
+      loadAll();
+      window.setInterval(loadAll, 1000);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,34 @@
+{
+  "name": "codex-agent-orchestrator",
+  "version": "0.1.0",
+  "description": "Long-running Codex CLI orchestrator for plan-execute-smoke-report loops.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "orch": "./dist/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "link-cli": "npm link",
+    "orch": "tsx src/cli/main.ts",
+    "plan": "tsx src/cli/main.ts plan",
+    "serve": "tsx src/cli/main.ts serve",
+    "dev": "tsx src/cli/main.ts",
+    "doctor": "tsx src/cli/main.ts doctor",
+    "test": "node --test --test-concurrency=1 --import tsx test/create-run.test.ts"
+  },
+  "keywords": [
+    "codex",
+    "agent",
+    "orchestrator",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
