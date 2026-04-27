@@ -23,6 +23,7 @@ export interface WorkerResult {
   model: string;
   status: "pending" | "completed" | "failed";
   ephemeral: boolean;
+  sessionId?: string | null;
   promptPath: string;
   schemaPath: string;
   responsePath: string;
@@ -124,6 +125,7 @@ export interface TaskExecutionRecord {
   title: string;
   status: TaskStatus;
   taskMode?: TaskMode;
+  sessionId?: string | null;
   model?: string;
   currentAction?: string;
   startedAt?: string;
@@ -175,7 +177,7 @@ export interface PlannerResponseEnvelope {
   assistant_response: string;
   plan_complete: boolean;
   plan_update: null | {
-    summary: string;
+    summary?: string;
     tasks: Array<{
       id: string;
       title: string;

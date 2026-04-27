@@ -142,6 +142,34 @@ function buildPlannerExecArgs(model: string, responsePath: string, sessionId: st
   ];
 }
 
+function buildTaskExecArgs(
+  model: string,
+  sandboxMode: "read-only" | "workspace-write",
+  schemaPath: string,
+  responsePath: string,
+  sessionId: string | null,
+): string[] {
+  if (sessionId) {
+    return [
+      "exec",
+      "-s",
+      sandboxMode,
+      "resume",
+      ...buildOrchestratorExecCommonArgs(),
+      "-m",
+      model,
+      "--json",
+      "--output-schema",
+      schemaPath,
+      "--output-last-message",
+      responsePath,
+      sessionId,
+      "-",
+    ];
+  }
+  return buildExecArgs(model, sandboxMode, schemaPath, responsePath, false);
+}
+
 function isRetryableApiFailure(errorText: string): boolean {
   return RETRYABLE_API_FAILURE_PATTERNS.some((pattern) => pattern.test(errorText));
 }
@@ -405,7 +433,7 @@ function buildPlannerSchema(): string {
             {
               type: "object",
               additionalProperties: false,
-              required: ["summary", "tasks"],
+              required: ["tasks"],
               properties: {
                 summary: { type: "string" },
                 tasks: {
@@ -542,7 +570,7 @@ function parsePlannerEnvelope(raw: string): PlannerResponseEnvelope {
   return parsed as PlannerResponseEnvelope;
 }
 
-function extractPlannerSessionId(event: unknown): string | null {
+function extractThreadSessionId(event: unknown): string | null {
   if (!event || typeof event !== "object") {
     return null;
   }
@@ -634,6 +662,7 @@ export async function runPlannerTurn(
   run: RunRecord,
   turns: PlannerTurnRecord[],
   userMessage: string,
+  abortSignal?: AbortSignal,
   onJsonEvent?: (event: unknown) => void,
 ): Promise<{ envelope: PlannerResponseEnvelope; worker: WorkerResult; context: RunRecord["context"]; sessionId: string | null }> {
   const turnId = crypto.randomUUID();
@@ -658,9 +687,9 @@ export async function runPlannerTurn(
       buildPlannerExecArgs(run.settings.plannerModel, artifact.responsePath, run.planner.sessionId),
       run.repoPath,
       prompt,
-      undefined,
+      abortSignal,
       (event) => {
-        const nextSessionId = extractPlannerSessionId(event);
+        const nextSessionId = extractThreadSessionId(event);
         if (nextSessionId) {
           sessionId = nextSessionId;
         }
@@ -676,6 +705,7 @@ export async function runPlannerTurn(
       model: run.settings.plannerModel,
       status: result.exitCode === 0 ? "completed" : "failed",
       ephemeral: false,
+      sessionId,
       promptPath: artifact.promptPath,
       schemaPath: artifact.schemaPath,
       responsePath: artifact.responsePath,
@@ -714,6 +744,7 @@ export async function runTaskWorker(
 ): Promise<{
   response: TaskWorkerResponse;
   worker: WorkerResult;
+  sessionId: string | null;
   contextPatch: Pick<TaskExecutionRecord, "checkpointSummary" | "wakeDeltaSummary" | "lastWakeEventCount" | "lastWakeNoteCount">;
 }> {
   const workerRoot = path.join(getTaskRoot(run.repoPath, run.runId, task.id), "worker");
@@ -731,26 +762,68 @@ export async function runTaskWorker(
   const prompt = assembled.prompt;
   const schema = buildTaskSchema();
   const artifact = await persistWorkerArtifacts(workerRoot, prompt, schema, run.repoPath);
-  const worker = await artifact.run(prompt, run.settings.taskWorkerModel, "workspace-write", true, abortSignal, onJsonEvent);
+  let sessionId = taskState?.sessionId ?? null;
+  let artifactsWritten = false;
 
-  await writeWorkerResult(run.repoPath, run.runId, task.id, worker);
+  try {
+    const result = await runCodexCommand(
+      buildTaskExecArgs(run.settings.taskWorkerModel, "workspace-write", artifact.schemaPath, artifact.responsePath, taskState?.sessionId ?? null),
+      run.repoPath,
+      prompt,
+      abortSignal,
+      (event) => {
+        const nextSessionId = extractThreadSessionId(event);
+        if (nextSessionId) {
+          sessionId = nextSessionId;
+        }
+        onJsonEvent?.(event);
+      },
+    );
 
-  if (worker.exitCode !== 0) {
-    throw new Error(`Task worker failed with exit code ${worker.exitCode}.`);
+    await fs.writeFile(artifact.stdoutPath, result.stdout, "utf8");
+    await fs.writeFile(artifact.stderrPath, result.stderr, "utf8");
+    artifactsWritten = true;
+
+    const worker: WorkerResult = {
+      model: run.settings.taskWorkerModel,
+      status: result.exitCode === 0 ? "completed" : "failed",
+      ephemeral: false,
+      sessionId,
+      promptPath: artifact.promptPath,
+      schemaPath: artifact.schemaPath,
+      responsePath: artifact.responsePath,
+      stdoutPath: artifact.stdoutPath,
+      stderrPath: artifact.stderrPath,
+      exitCode: result.exitCode,
+    };
+
+    await writeWorkerResult(run.repoPath, run.runId, task.id, worker);
+
+    if (worker.exitCode !== 0) {
+      throw new Error(`Task worker failed with exit code ${worker.exitCode}.`);
+    }
+
+    const content = await fs.readFile(artifact.responsePath, "utf8");
+    const response = JSON.parse(content) as TaskWorkerResponse;
+    return {
+      response,
+      worker,
+      sessionId,
+      contextPatch: {
+        checkpointSummary: response.summary,
+        wakeDeltaSummary: assembled.wakeDeltaSummary ?? undefined,
+        lastWakeEventCount: assembled.wakeEventCount,
+        lastWakeNoteCount: assembled.wakeNoteCount,
+      },
+    };
+  } catch (error) {
+    if (!artifactsWritten) {
+      const message = error instanceof Error ? error.message : String(error);
+      await fs.writeFile(artifact.stdoutPath, "", "utf8");
+      await fs.writeFile(artifact.stderrPath, message, "utf8");
+    }
+    throw error;
   }
-
-  const content = await fs.readFile(artifact.responsePath, "utf8");
-  const response = JSON.parse(content) as TaskWorkerResponse;
-  return {
-    response,
-    worker,
-    contextPatch: {
-      checkpointSummary: response.summary,
-      wakeDeltaSummary: assembled.wakeDeltaSummary ?? undefined,
-      lastWakeEventCount: assembled.wakeEventCount,
-      lastWakeNoteCount: assembled.wakeNoteCount,
-    },
-  };
 }
 
 export async function runContextMaintenanceWorker(

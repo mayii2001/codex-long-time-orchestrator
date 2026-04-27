@@ -16,7 +16,17 @@ import {
   setRunStatus,
   updateRunState,
 } from "../orchestrator/run-store.js";
-import { executeFrozenPlan, freezeCurrentDraft, isExecutionLive, maintainCompressedContext, submitPlannerMessage, submitPlannerMessageWithEvents, terminateTaskExecution } from "../orchestrator/planner-runner.js";
+import {
+  executeFrozenPlan,
+  freezeCurrentDraft,
+  isExecutionLive,
+  isPlannerAbortError,
+  maintainCompressedContext,
+  submitPlannerMessage,
+  submitPlannerMessageWithEvents,
+  terminatePlannerStreaming,
+  terminateTaskExecution,
+} from "../orchestrator/planner-runner.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(MODULE_DIR, "..", "..");
@@ -282,6 +292,20 @@ export async function startAppServer(port: number): Promise<http.Server> {
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
+        let streamSettled = false;
+        const handleClientDisconnect = (): void => {
+          if (streamSettled) {
+            return;
+          }
+          streamSettled = true;
+          void (async () => {
+            const latestRun = await readRunState(project.repoPath, runId);
+            if (latestRun.planner.isStreaming) {
+              await terminatePlannerStreaming(latestRun, "Planner stream ended because the browser connection closed.");
+            }
+          })();
+        };
+        response.on("close", handleClientDisconnect);
         const streamStartedAt = Date.now();
         const heartbeatTimer = setInterval(() => {
           writeSseEvent(response, {
@@ -298,16 +322,42 @@ export async function startAppServer(port: number): Promise<http.Server> {
           writeSseEvent(response, { type: "run_state", payload: next });
           writeSseEvent(response, { type: "done", payload: { ok: true } });
         } catch (error) {
-          writeSseEvent(response, {
-            type: "error",
-            payload: {
-              message: error instanceof Error ? error.message : String(error),
-            },
-          });
+          if (isPlannerAbortError(error)) {
+            writeSseEvent(response, {
+              type: "planner_interrupted",
+              payload: {
+                message: error instanceof Error ? error.message : "Planner interrupted.",
+              },
+            });
+          } else {
+            writeSseEvent(response, {
+              type: "error",
+              payload: {
+                message: error instanceof Error ? error.message : String(error),
+              },
+            });
+          }
         } finally {
+          streamSettled = true;
+          response.off("close", handleClientDisconnect);
           clearInterval(heartbeatTimer);
           response.end();
         }
+        return;
+      }
+
+      const plannerTerminateMatch = pathname.match(/^\/api\/runs\/([^/]+)\/planner\/terminate$/);
+      if (request.method === "POST" && plannerTerminateMatch) {
+        const runId = decodeURIComponent(plannerTerminateMatch[1]);
+        const index = await readProjectIndex();
+        const project = index.projects.find((entry) => entry.runIds.includes(runId));
+        if (!project) {
+          sendJson(response, 404, { error: "Run not found" });
+          return;
+        }
+        const run = await readRunState(project.repoPath, runId);
+        const next = await terminatePlannerStreaming(run);
+        sendJson(response, 202, next);
         return;
       }
 

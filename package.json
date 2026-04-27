@@ -16,7 +16,7 @@
     "serve": "tsx src/cli/main.ts serve",
     "dev": "tsx src/cli/main.ts",
     "doctor": "tsx src/cli/main.ts doctor",
-    "test": "node --test --test-concurrency=1 --import tsx test/create-run.test.ts"
+    "test": "node --import tsx test/create-run.test.ts"
   },
   "keywords": [
     "codex",

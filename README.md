@@ -1,151 +1,155 @@
 # Codex Long-time Orchestrator
 
-[English](README.en.md)
+[中文](README.zh.md)
 
-`Codex Long-time Orchestrator` 是一个把 `Codex CLI` 接到长时间工作流里的本地编排器。它面向的不是一次性问答，而是那类真正会持续几十分钟、几小时，甚至需要反复检查日志、修复问题、重新执行的工程任务。
+`Codex Long-time Orchestrator` is a local orchestration layer for `Codex CLI`. It is built for engineering work that does not finish in a single model call: long-running tests, smoke checks, remote jobs, repeated log inspection, bug fixing, and re-execution over time.
 
- `codex` 流程进入等待、轮询、远端任务、长时间测试或 smoke 检查时，原来的会话容易中断且无法定时唤醒继续TDD。这个项目的目标，就是把“模型负责思考和执行”与“宿主进程负责等待、唤起、保存状态和展示历史”拆开，让任务能够持续跑下去，而不是停在某一次超时之后。
+The core problem behind this project is straightforward. `codex exec` is effective for starting work, but once a task enters waiting, polling, or long-running execution, the original session does not reliably wake itself up and continue the loop. This repository separates responsibilities so the model can focus on reasoning and execution, while a persistent host process handles waiting, wake-ups, state storage, and history presentation.
 
-对使用者来说，可以把它理解成一个面向工程实验循环的控制台。你在网页里和主 agent 对话，主 agent 生成计划、启动执行、在等待周期里再次被唤起检查进度、决定是否修代码或继续跑。所有这些过程都会按项目留下历史记录，便于复盘和汇报。
+For users and stakeholders, the system behaves like a control surface for engineering experiment loops. You talk to the main agent in the browser, the agent plans and starts execution, the host process keeps the run alive during waiting periods, and the agent is invoked again later to inspect progress, fix issues, and continue the task. The full process is stored per project so it can be reviewed and reported clearly.
 
-## 它解决什么问题
+## What It Solves
 
-这个项目主要解决四类问题。
+This project is designed to solve four practical problems.
 
-- 一次性 `codex exec` 很难覆盖长时间任务。
-- 任务进入等待后，模型不会自动回来检查进度。
-- 多轮实验之后，很难清楚知道某个项目到底跑到了哪里、失败在什么地方。
-- 需要给团队或管理者说明过程时，缺少连续、可回放的执行记录。
+- A single `codex exec` call is not enough for long-running workflows.
+- Once a task enters waiting, the model does not automatically come back to inspect progress.
+- After several iterations, it becomes hard to explain what happened, where a run stopped, and why it failed.
+- Teams need a continuous, replayable history when reviewing engineering experiments or reporting status.
 
-它适合的典型场景包括：
+Typical use cases include:
 
-- 推送代码到服务器后启动远端测试，再按固定间隔检查日志
-- 跑 smoke、训练、批处理或其他长时间任务
-- 一边执行，一边让主 agent 根据新日志继续定位问题和修复
-- 在同一个项目里多次反复尝试不同方案，并保留完整 run 历史
+- pushing code to a server, launching tests, and checking logs at fixed intervals
+- running smoke checks, training jobs, or other long-running tasks
+- continuing execution while the main agent inspects new logs and fixes issues
+- keeping multiple runs per project with complete history
 
-## 它如何工作
+## How It Works
 
-本系统不是一个永远挂着的超长 Codex 会话。它的工作方式更像一个常驻宿主去反复调用模型。
+This is not a single permanent Codex session. It is closer to a persistent host process that repeatedly invokes the model with the right context.
 
-当你在网页里发送一条消息时，宿主会读取当前 run 已保存的上下文，再发起一次真实的 `codex exec`。当执行进入等待期时，等待由 orchestrator 自己持有，而不是让某个 Codex 进程在后台无意义地挂着。等到下一次检查时间到了，宿主再重新唤起模型，让它基于最新状态继续判断、修复或推进任务。
+When you send a message in the web UI, the host loads the saved run context and starts a real `codex exec` call. When execution enters a waiting phase, the waiting is owned by the orchestrator instead of leaving a Codex process idle in the background. When the next check time arrives, the host wakes the model again so it can inspect the latest state, decide what to do next, and continue the loop.
 
-这带来三个直接结果。第一，任务历史是完整落盘的。第二，浏览器刷新不会丢执行状态。第三，即使宿主进程中断，系统也能根据已保存状态决定是继续规划、恢复执行，还是重新发起下一轮。
+That design gives three useful properties. First, the run history is stored on disk. Second, refreshing the browser does not lose execution state. Third, if the host process is interrupted, the system can decide whether to resume planning, continue execution, or start the next cycle from the saved state.
 
-当前版本里，主 agent 与 task worker 的上下文策略已经分开。主 agent 不再走一次性 `ephemeral` 模式，而是为每个 run 维护一个持久的 Codex planner session，并在后续对话里优先使用 `codex exec resume` 继续同一条 session。task worker 仍然保持短生命周期，但在长任务场景里，宿主会为它补上上一次检查后的事件增量、任务 checkpoint 和执行摘要，而不是每轮都从一段松散历史里自己猜上下文。
+In the current implementation, the main agent and task workers no longer share the same context strategy. The main agent no longer runs in one-shot ephemeral mode. Instead, each run keeps a durable Codex planner session and later planner turns prefer `codex exec resume` so the same session can continue. Repeated execution on the same task now keeps its own session id as well. Each wake still starts a fresh `codex` subprocess, but the second and later calls for the same task use `codex exec resume` so task-local context is preserved across wake cycles. The host still injects execution checkpoints and deltas since the previous wake instead of forcing each wake-up to reconstruct context from loose history.
 
-## 安装与第一次启动
+## Installation and First Start
 
-下面这组步骤是推荐的标准安装流程。第一次做完之后，后续在任何项目目录里都可以直接使用 `orch`。
+The following is the recommended setup flow. Once it is done, you can use `orch` directly from any project directory.
 
-1. 进入本仓库目录，安装依赖。
+1. Open this repository and install dependencies.
 
 ```bash
 npm install
 ```
 
-2. 编译 CLI。
+2. Build the CLI.
 
 ```bash
 npm run build
 ```
 
-3. 把 `orch` 注册到当前机器的命令行。这个步骤通常只需要做一次。
+3. Register `orch` in your local command line. In most cases, this only needs to be done once.
 
 ```bash
 npm run link-cli
 ```
 
-4. 检查本机环境是否正常。
+4. Verify that the local environment is ready.
 
 ```bash
 npm run doctor
 ```
 
-5. 切换到你真正想工作的项目目录，直接启动 orchestrator。
+5. Move into the project you actually want to work on and start the orchestrator.
 
 ```bash
 orch plan
 ```
 
-这条命令会立即创建一个新的 run、启动本地网页服务、自动打开浏览器，并把你带到当前项目的主界面。
+This creates a new run, starts the local web server, opens the browser, and lands you in the planner page for the current project.
 
-如果你此时不在目标项目目录里，也可以显式指定：
+If you are not inside the target project directory, you can specify it explicitly:
 
 ```bash
 orch plan --repo C:\path\to\your-project
 ```
 
-如果你正在开发这个仓库本身，而不是把它当工具使用，也可以在仓库内直接运行：
+If you are developing this repository itself instead of using it as a tool, you can also run:
 
 ```bash
 npm run plan
 ```
 
-## 日常使用
+## Day-to-Day Usage
 
-日常使用时，流程通常很简单。你在项目目录里执行 `orch plan`，然后在网页里和主 agent 对话。主 agent 会在空闲时承担 planner 角色，帮助你把任务整理成结构化计划；在执行中，它会继续回答当前进度、失败原因和下一步建议。
+In normal use, the flow is simple. Run `orch plan` inside a project, then talk to the main agent in the browser. When the system is idle, the main agent acts as the planner and helps shape a structured execution plan. During execution, the same main agent can continue answering progress questions, explain failures, and suggest the next step.
 
-当右侧 draft 已经完整时，你点击 `Freeze Plan`，把当前草稿冻结成执行计划。随后点击 `Start Execute`，任务就会进入后台执行。网页会持续显示 run 状态、task 状态、事件流、等待时间和最近的 worker 产物。对长时间任务来说，你还可以设置检查间隔，让系统在等待一段时间后主动再次唤起模型检查进度，而不是停在某次等待之后。
+Once the draft is complete, click `Freeze Plan` to turn it into an execution plan. Then click `Start Execute` to hand the work to the background executor. The browser will keep showing run status, task status, events, waiting periods, and recent worker output. For long-running tasks, you can also configure a check interval so the system wakes the model again after a period of time instead of stopping after one wait.
 
-左侧的 run 历史会优先显示该 run 第一次 plan 对话的主题，这样同一个项目里有多次尝试时，你可以直接按任务意图回看，而不是只靠一串 run id 去辨认。
+The run history in the left sidebar prefers the topic from the first planning message for each run. That makes repeated attempts inside the same project easier to scan by intent instead of forcing you to recognize runs only by UUID.
 
-如果某个 task 已经进入执行或等待，但你确认这轮不该再继续，右侧 `Task Process` 面板里可以直接终止选中的 task。这个动作会中断当前 run 的执行，并把终止原因写回 task 状态和事件流，便于后续继续规划或重新执行。
+If a planner turn is taking too long, or the browser connection drops and you no longer want to wait, `Interrupt Planner` can stop the current main-agent turn explicitly. This terminates the backend `codex` planner subprocess itself instead of only cancelling the browser request. If the streaming browser connection drops unexpectedly, the backend also stops that planner turn automatically so the run does not stay stuck in `Planner is running...`.
 
-如果执行被中断，系统会保留已完成 task 的状态。下一次重新进入这个 run 时，你可以继续规划，也可以直接重新发起执行，让系统从未完成部分继续往下跑。
+If a task is already running or waiting and you know the current attempt should stop, the `Task Process` panel can terminate the selected task explicitly. That interrupts the current run execution and writes the operator stop reason back into task state and event history so the next planning or rerun step starts from an honest state.
 
-## 常用命令
+If execution is interrupted, completed tasks remain recorded. The next time you open the run, you can continue planning or resume execution from the unfinished part.
 
-- 启动主界面：`orch plan`
-- 只启动网页服务：`orch serve`
-- 查看某个 run 的状态：`orch status --run-id <run-id>`
-- 冻结当前草稿：`orch freeze --run-id <run-id>`
-- 执行当前冻结计划：`orch execute --run-id <run-id>`
-- 输出简要报告：`orch report --run-id <run-id>`
-- 取消 run：`orch cancel --run-id <run-id>`
-- 删除 run：`orch delete-run --run-id <run-id>`
+## Common Commands
 
-这些命令默认都以当前目录作为项目目录。如果你不在目标项目里，再补上 `--repo <path>` 即可。
+- start the main UI: `orch plan`
+- start only the web server: `orch serve`
+- inspect a run state: `orch status --run-id <run-id>`
+- freeze the current draft: `orch freeze --run-id <run-id>`
+- execute the frozen plan: `orch execute --run-id <run-id>`
+- print a short report: `orch report --run-id <run-id>`
+- cancel a run: `orch cancel --run-id <run-id>`
+- delete a run: `orch delete-run --run-id <run-id>`
 
-## 数据存储
+All of these commands use the current directory as the project directory by default. If you are outside the target project, add `--repo <path>`.
 
-这个项目的详细运行数据主要存放在项目目录内部，而不是分散写到用户目录的各个角落。
+## Where Data Is Stored
 
-每个 run 都会写在：
+Detailed run data is primarily stored inside the project directory rather than scattered across the user profile.
+
+Each run is written under:
 
 ```text
 .orchestrator/runs/<run-id>/
 ```
 
-这里会保存状态、事件、planner 历史、draft 版本、冻结后的执行计划，以及各个 task 的 worker 输出。
+This contains state, events, planner history, draft versions, the frozen execution plan, and worker output for each task.
 
-run 状态里还会额外保存一组 checkpoint 摘要，用来压缩长对话上下文，包括目标摘要、计划摘要、执行摘要，以及最近一次 planner prompt 的压缩元信息。长任务 task 还会保存自己的 checkpoint 和上一次唤醒游标，供下一轮增量检查使用。
+The run state also stores checkpoint summaries used for context management, including goal, plan, execution, and planner prompt compression metadata. Long-running task records keep their own checkpoint summary plus wake cursors so the next scheduled check can receive delta-based context.
 
-用户目录里默认只会额外维护一份全局项目索引：
+By default, the user directory only stores a global project index:
 
 ```text
 %USERPROFILE%\.codex\codex-agent-orchestrator\projects.json
 ```
 
-如果你设置了 `ORCH_HOME`，这个索引会改写到你指定的目录。
+If you set `ORCH_HOME`, that index will be written to the directory you specify.
 
-## 当前的局限性
+## Current Scope and Limits
 
-到目前为止，这个项目已经具备一条可用的主链路。它支持从项目目录直接启动、网页对话式规划、冻结执行计划、后台执行、等待期状态保存、执行中继续与主 agent 交流，以及按项目查看历史 run。
+At this point, the project already has a usable main path. It supports starting directly from a project directory, browser-based planning, freezing an execution plan, background execution, preserved waiting state, continued conversation with the main agent during execution, and project-scoped run history.
 
-它也已经支持一些更实际的工程细节，比如模型选择、并发数上限、长时间任务的检查间隔、任务过程查看、超长日志截断显示，以及执行失败后基于已完成 task 的续跑。
+It also includes practical engineering features such as model selection, concurrency limits, a configurable check interval for long-running tasks, task process inspection, truncated large logs in the UI, and resume behavior that skips already completed tasks.
 
-但它依然不是一个已经充分验证过的成熟产品。更复杂的多任务冲突调度、远端任务恢复、完整 reviewer 流程、更细的权限和审批链路，以及更强的筛选和对比视图，仍然需要继续补强。
+Recent manual validation also includes a repeated 10-second wake-up scenario. For that scenario, a run is considered successful when `checkIteration` reaches at least `3`, which confirms that the orchestrator can wake the same task repeatedly instead of only surviving a single wait.
 
-## 免责声明
+That said, this is still not a fully validated production system. More advanced conflict-aware scheduling, stronger remote-job recovery, a fuller reviewer flow, stricter approval boundaries, and more mature filtering and comparison views still need work.
 
-这个项目目前仍处在持续迭代阶段。它已经有一套可运行、可测试、可演示的主流程，但**没有经过所有真实业务场景的完整验证**。README 中描述的是当前实现意图和已完成能力，不应被理解为对所有环境、所有仓库、所有远端执行场景都已经稳定适配。
+## Disclaimer
 
-如果你准备把它用于正式实验、生产前验证或对外汇报，建议先在受控项目里完成一轮端到端试跑，再决定是否扩展到更高风险的任务。对外沟通时，也应明确说明它当前属于工程化中的实验性工具，而不是已经完成全面验证的通用平台。
+This project is still under active iteration. It already has a runnable, testable, and demonstrable main flow, but it has **not** been fully validated across every real-world business scenario. The README describes current intent and implemented capabilities, not a guarantee that every environment, repository, or remote execution setup is already stable.
 
-## 开发说明
+If you plan to use it for formal experiments, pre-production validation, or external reporting, it is better to run an end-to-end trial in a controlled project first. When communicating externally, it should still be presented as an engineering tool under active development rather than a universally verified platform.
 
-如果你要继续开发这个仓库本身，最常用的命令是：
+## Development
+
+If you are continuing development on this repository itself, the most common commands are:
 
 ```bash
 npm run build
@@ -153,4 +157,4 @@ npm test
 npm run plan
 ```
 
-当前测试已经覆盖 run scaffold、planner 生成 draft、冻结执行计划、后台执行、设置保存、长任务定期检查、历史删除、断流恢复和若干 API 行为。它足够支撑日常迭代，但还不足以替代真实场景验证。
+The current test suite covers run scaffold creation, planner draft generation, freezing execution plans, background execution, settings persistence, periodic checks for long-running tasks, run deletion, interrupted-stream recovery, and several API behaviors. It is strong enough for daily iteration, but it is not a substitute for real scenario validation.

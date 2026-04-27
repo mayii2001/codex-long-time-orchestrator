@@ -28,6 +28,17 @@ import type {
 const EXECUTION_HEARTBEAT_INTERVAL_MS = 2_000;
 const EXECUTION_HEARTBEAT_TTL_MS = 15_000;
 const activeExecutionControllers = new Map<string, AbortController>();
+const activePlannerControllers = new Map<string, AbortController>();
+const PLANNER_INTERRUPTED_BY_OPERATOR = "Planner interrupted by operator.";
+const PLANNER_INTERRUPTED_BY_DISCONNECT = "Planner stream ended because the browser connection closed.";
+
+function isPlannerAbortMessage(message: string): boolean {
+  return message === PLANNER_INTERRUPTED_BY_OPERATOR || message === PLANNER_INTERRUPTED_BY_DISCONNECT;
+}
+
+export function isPlannerAbortError(error: unknown): boolean {
+  return error instanceof Error && isPlannerAbortMessage(error.message);
+}
 
 interface TerminateTaskReason {
   type: "task-terminated";
@@ -101,6 +112,40 @@ export async function terminateTaskExecution(run: RunRecord, taskId: string): Pr
   return await readRunState(run.repoPath, run.runId);
 }
 
+export async function terminatePlannerStreaming(
+  run: RunRecord,
+  reason = PLANNER_INTERRUPTED_BY_OPERATOR,
+): Promise<RunRecord> {
+  if (!run.planner.isStreaming) {
+    throw new Error(`Run ${run.runId} does not have a planner turn in progress.`);
+  }
+  const controller = activePlannerControllers.get(run.runId);
+  const timestamp = new Date().toISOString();
+
+  if (controller) {
+    controller.abort(new Error(reason));
+    await appendRunEvent(run.repoPath, run.runId, {
+      timestamp,
+      type: reason === PLANNER_INTERRUPTED_BY_DISCONNECT ? "planner_stream_disconnected" : "planner_termination_requested",
+      detail: reason,
+    });
+    return await waitForPlannerStreamingToStop(run.repoPath, run.runId);
+  }
+
+  await updateRunState(run.repoPath, run.runId, {
+    planner: {
+      ...run.planner,
+      isStreaming: false,
+    },
+  });
+  await appendRunEvent(run.repoPath, run.runId, {
+    timestamp,
+    type: "planner_stream_cleared",
+    detail: `${reason} Cleared stale planner streaming state without a live planner process.`,
+  });
+  return await readRunState(run.repoPath, run.runId);
+}
+
 async function reopenRunForPlanning(run: RunRecord, reason: string): Promise<RunRecord> {
   if (run.phase === "planning" && run.status === "active") {
     return run;
@@ -140,29 +185,30 @@ function validateDraft(draft: PlanDraft | null): string[] {
   }
 
   const missing: string[] = [];
-  if (!draft.summary.trim()) {
-    missing.push("Plan summary is required.");
-  }
   if (draft.tasks.length === 0) {
     missing.push("At least one task is required.");
   }
 
   const taskIds = new Set<string>();
   for (const task of draft.tasks) {
-    if (!task.id.trim()) {
+    if (typeof task.id !== "string" || !task.id.trim()) {
       missing.push("Task id is required.");
     }
-    if (taskIds.has(task.id)) {
+    if (typeof task.id === "string" && taskIds.has(task.id)) {
       missing.push(`Task id must be unique: ${task.id}`);
     }
-    taskIds.add(task.id);
-    if (!task.title.trim()) {
+    if (typeof task.id === "string") {
+      taskIds.add(task.id);
+    }
+    if (typeof task.title !== "string" || !task.title.trim()) {
       missing.push(`Task ${task.id} title is required.`);
     }
-    if (!task.workerPrompt.trim()) {
+    if (typeof task.workerPrompt !== "string" || !task.workerPrompt.trim()) {
       missing.push(`Task ${task.id} worker prompt is required.`);
     }
-    if (task.waitPolicy.minMs > task.waitPolicy.maxMs) {
+    if (!Number.isFinite(task.waitPolicy.minMs) || !Number.isFinite(task.waitPolicy.maxMs)) {
+      missing.push(`Task ${task.id} wait range is required.`);
+    } else if (task.waitPolicy.minMs > task.waitPolicy.maxMs) {
       missing.push(`Task ${task.id} wait range is invalid.`);
     }
   }
@@ -189,19 +235,44 @@ function evaluatePlannerReadiness(draft: PlanDraft | null, planComplete: boolean
   };
 }
 
-function convertDraft(version: number, source: NonNullable<Awaited<ReturnType<typeof runPlannerTurn>>["envelope"]["plan_update"]>): PlanDraft {
+function deriveDraftSummary(
+  source: NonNullable<Awaited<ReturnType<typeof runPlannerTurn>>["envelope"]["plan_update"]>,
+  assistantResponse: string,
+): string {
+  if (typeof source.summary === "string" && source.summary.trim()) {
+    return source.summary;
+  }
+  const titles = source.tasks
+    .map((task) => (typeof task.title === "string" ? task.title.trim() : ""))
+    .filter((title) => title.length > 0);
+  if (titles.length === 0) {
+    return assistantResponse.trim();
+  }
+  if (titles.length === 1) {
+    return titles[0];
+  }
+  return `${titles[0]} (+${titles.length - 1} more tasks)`;
+}
+
+function convertDraft(
+  version: number,
+  source: NonNullable<Awaited<ReturnType<typeof runPlannerTurn>>["envelope"]["plan_update"]>,
+  assistantResponse: string,
+): PlanDraft {
   return {
     version,
-    summary: source.summary,
+    summary: deriveDraftSummary(source, assistantResponse),
     tasks: source.tasks.map((task) => ({
-      id: task.id,
-      title: task.title,
-      dependsOn: task.depends_on,
-      workerPrompt: task.worker_prompt,
+      id: typeof task.id === "string" ? task.id : "",
+      title: typeof task.title === "string" ? task.title : "",
+      dependsOn: Array.isArray(task.depends_on)
+        ? task.depends_on.filter((dependency): dependency is string => typeof dependency === "string")
+        : [],
+      workerPrompt: typeof task.worker_prompt === "string" ? task.worker_prompt : "",
       taskMode: task.task_mode ?? "default",
       waitPolicy: {
-        minMs: task.wait_range_ms.min,
-        maxMs: task.wait_range_ms.max,
+        minMs: Number.isFinite(task.wait_range_ms?.min) ? task.wait_range_ms.min : Number.NaN,
+        maxMs: Number.isFinite(task.wait_range_ms?.max) ? task.wait_range_ms.max : Number.NaN,
       },
     })),
   };
@@ -289,6 +360,18 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+async function waitForPlannerStreamingToStop(repoPath: string, runId: string, timeoutMs = 2_000): Promise<RunRecord> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    const current = await readRunState(repoPath, runId);
+    if (!current.planner.isStreaming && !activePlannerControllers.has(runId)) {
+      return current;
+    }
+    await sleep(25);
+  }
+  return await readRunState(repoPath, runId);
+}
+
 async function setPlannerStreamingState(run: RunRecord, isStreaming: boolean): Promise<void> {
   const current = await readRunState(run.repoPath, run.runId);
   await updateRunState(run.repoPath, run.runId, {
@@ -331,7 +414,7 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
 
     if (envelope.plan_update) {
       draftVersion += 1;
-      activeDraft = convertDraft(draftVersion, envelope.plan_update);
+      activeDraft = convertDraft(draftVersion, envelope.plan_update, envelope.assistant_response);
       await writeDraft(currentRun.repoPath, currentRun.runId, activeDraft);
     }
 
@@ -396,13 +479,24 @@ export async function submitPlannerMessageWithEvents(
     ? run
     : await reopenRunForPlanning(run, "Planner resumed after previous execution state ended.");
   const turns = await listPlannerTurns(run.repoPath, run.runId);
+  if (activePlannerControllers.has(currentRun.runId)) {
+    throw new Error(`Planner is already running for run ${currentRun.runId}.`);
+  }
+  const plannerController = new AbortController();
+  activePlannerControllers.set(currentRun.runId, plannerController);
   await setPlannerStreamingState(currentRun, true);
   onEvent({ type: "planner_started", payload: { message: "Planner started." } });
 
   try {
-    const { envelope, worker, context: plannerContext, sessionId } = await runPlannerTurn(currentRun, turns, userMessage, (jsonEvent) => {
-      onEvent({ type: "planner_event", payload: jsonEvent });
-    });
+    const { envelope, worker, context: plannerContext, sessionId } = await runPlannerTurn(
+      currentRun,
+      turns,
+      userMessage,
+      plannerController.signal,
+      (jsonEvent) => {
+        onEvent({ type: "planner_event", payload: jsonEvent });
+      },
+    );
     const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
 
     let draftVersion = currentRun.planner.activeDraftVersion ?? 0;
@@ -410,7 +504,7 @@ export async function submitPlannerMessageWithEvents(
 
     if (envelope.plan_update) {
       draftVersion += 1;
-      activeDraft = convertDraft(draftVersion, envelope.plan_update);
+      activeDraft = convertDraft(draftVersion, envelope.plan_update, envelope.assistant_response);
       await writeDraft(currentRun.repoPath, currentRun.runId, activeDraft);
       onEvent({ type: "planner_draft_updated", payload: activeDraft });
     }
@@ -474,6 +568,7 @@ export async function submitPlannerMessageWithEvents(
 
     return next;
   } finally {
+    activePlannerControllers.delete(currentRun.runId);
     await setPlannerStreamingState(currentRun, false);
   }
 }
@@ -559,7 +654,7 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
   await updateRunState(run.repoPath, run.runId, { execution });
 
   const workerRun = await readRunState(run.repoPath, run.runId);
-  const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id], signal);
+  const { response, sessionId, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id], signal);
 
   if (response.should_wait) {
     if (response.wait_ms < task.waitPolicy.minMs || response.wait_ms > task.waitPolicy.maxMs) {
@@ -572,6 +667,7 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
       waitDecisionMs: response.wait_ms,
       waitStartedAt: new Date().toISOString(),
       waitUntil: new Date(Date.now() + response.wait_ms).toISOString(),
+      sessionId,
       summary: response.summary,
       checkpointSummary: contextPatch.checkpointSummary,
       wakeDeltaSummary: contextPatch.wakeDeltaSummary,
@@ -603,6 +699,7 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
     status: "completed",
     currentAction: "completed",
     waitDecisionMs: response.wait_ms,
+    sessionId,
     summary: response.summary,
     checkpointSummary: contextPatch.checkpointSummary,
     wakeDeltaSummary: contextPatch.wakeDeltaSummary,
@@ -646,7 +743,7 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
     });
 
     const workerRun = await readRunState(run.repoPath, run.runId);
-    const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id], signal);
+    const { response, sessionId, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id], signal);
     const checkedAt = new Date().toISOString();
 
     if (response.completed) {
@@ -657,6 +754,7 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
         waitDecisionMs: checkIntervalMs,
         checkIntervalMs,
         lastCheckAt: checkedAt,
+        sessionId,
         summary: response.summary,
         checkpointSummary: contextPatch.checkpointSummary,
         wakeDeltaSummary: contextPatch.wakeDeltaSummary,
@@ -690,6 +788,7 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
       checkIteration: nextIteration,
       lastCheckAt: checkedAt,
       nextCheckAt,
+      sessionId,
       summary: response.summary,
       checkpointSummary: contextPatch.checkpointSummary,
       wakeDeltaSummary: contextPatch.wakeDeltaSummary,

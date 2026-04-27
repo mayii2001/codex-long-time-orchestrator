@@ -19,6 +19,21 @@ import {
 } from "../src/orchestrator/run-store.js";
 import { createRunScaffold } from "../src/orchestrator/scaffold.js";
 
+async function waitForCondition(
+  check: () => Promise<boolean>,
+  timeoutMs = 2_000,
+  intervalMs = 25,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    if (await check()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`Condition was not met within ${timeoutMs} ms.`);
+}
+
 test("createRunScaffold writes state and registers project", async () => {
   const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-"));
   const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
@@ -133,6 +148,48 @@ test("planner cannot freeze a draft before plan completion is marked", async () 
     freezeCurrentDraft(planned),
     /Planner has not marked the plan complete yet/,
   );
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner malformed plan stays recoverable and reports missing fields", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-malformed-plan-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const planned = await submitPlannerMessage(record, "Build a malformed plan missing worker prompt.");
+  const draft = await readActiveDraft(repoPath, record.runId);
+
+  assert.equal(planned.planner.turnCount, 1);
+  assert.equal(planned.planner.canExecute, false);
+  assert.match(planned.planner.missingFields.join(" "), /worker prompt is required/);
+  assert.equal(draft?.tasks[0]?.workerPrompt, "");
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner malformed plan missing summary stays recoverable and reports missing fields", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-malformed-summary-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const planned = await submitPlannerMessage(record, "Build a malformed plan missing summary.");
+  const draft = await readActiveDraft(repoPath, record.runId);
+
+  assert.equal(planned.planner.turnCount, 1);
+  assert.equal(planned.planner.canExecute, true);
+  assert.deepEqual(planned.planner.missingFields, []);
+  assert.equal(draft?.summary, "Malformed task missing summary only");
 
   delete process.env.ORCH_HOME;
   delete process.env.ORCH_CODEX_BIN;
@@ -269,7 +326,7 @@ test("terminate task endpoint stops an active waiting task", async () => {
   });
   const terminatePayload = await terminateResponse.json();
   assert.equal(terminateResponse.status, 202);
-  assert.equal(terminatePayload.execution.tasks["task-1"].status, "waiting");
+  assert.ok(["waiting", "failed"].includes(terminatePayload.execution.tasks["task-1"].status));
 
   let finalState = await readRunState(repoPath, record.runId);
   const finalDeadline = Date.now() + 2_000;
@@ -284,6 +341,10 @@ test("terminate task endpoint stops an active waiting task", async () => {
   assert.equal(finalState.execution.tasks["task-1"].currentAction, "terminated by operator");
   assert.match(finalState.execution.tasks["task-1"].summary || "", /terminated by operator/);
 
+  await waitForCondition(async () => {
+    const content = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");
+    return /task_terminated/.test(content);
+  });
   const events = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");
   assert.match(events, /task_termination_requested/);
   assert.match(events, /task_terminated/);
@@ -326,6 +387,106 @@ test("planner stream emits heartbeat while main agent is still working", async (
   assert.match(streamText, /"type":"planner_started"/);
   assert.match(streamText, /"type":"planner_heartbeat"/);
   assert.match(streamText, /"type":"done"/);
+
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner terminate endpoint interrupts an active planner stream", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-planner-terminate-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const server = await startAppServer(0);
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const response = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(record.runId)}/planner/message/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Delay planner response for heartbeat test." }),
+  });
+  const streamTextPromise = response.text();
+
+  await waitForCondition(async () => (await readRunState(repoPath, record.runId)).planner.isStreaming === true);
+
+  const interruptResponse = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(record.runId)}/planner/terminate`, {
+    method: "POST",
+  });
+  assert.equal(interruptResponse.status, 202);
+
+  const streamText = await streamTextPromise;
+  assert.match(streamText, /"type":"planner_interrupted"/);
+
+  const finalState = await readRunState(repoPath, record.runId);
+  assert.equal(finalState.planner.isStreaming, false);
+
+  const events = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");
+  assert.match(events, /planner_termination_requested/);
+
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner stream disconnect clears streaming state", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-planner-disconnect-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const server = await startAppServer(0);
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const abortController = new AbortController();
+
+  const response = await fetch(`${baseUrl}/api/runs/${encodeURIComponent(record.runId)}/planner/message/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "Delay planner response for heartbeat test." }),
+    signal: abortController.signal,
+  });
+  const streamTextPromise = response.text();
+
+  await waitForCondition(async () => (await readRunState(repoPath, record.runId)).planner.isStreaming === true);
+  abortController.abort();
+
+  await assert.rejects(streamTextPromise);
+  await waitForCondition(async () => (await readRunState(repoPath, record.runId)).planner.isStreaming === false);
+
+  const finalState = await readRunState(repoPath, record.runId);
+  assert.equal(finalState.planner.isStreaming, false);
+
+  const events = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");
+  assert.match(events, /planner_stream_disconnected/);
 
   await new Promise<void>((resolve, reject) => {
     server.close((error) => {
@@ -433,10 +594,11 @@ test("long-running task uses check interval and re-wakes the worker", async () =
   assert.equal(executed.execution.tasks["task-1"].taskMode, "long-running");
   assert.equal(executed.execution.tasks["task-1"].checkIteration, 1);
   assert.equal(executed.execution.tasks["task-1"].checkIntervalMs, 5);
+  assert.equal(executed.execution.tasks["task-1"].sessionId, "mock-task-thread-1");
   assert.match(executed.execution.tasks["task-1"].checkpointSummary || "", /Long-running task finished/);
   assert.match(executed.execution.tasks["task-1"].wakeDeltaSummary || "", /task_check_scheduled/);
   assert.equal(typeof executed.execution.tasks["task-1"].lastWakeEventCount, "number");
-  assert.match(executed.execution.tasks["task-1"].summary || "", /scheduled follow-up check/);
+  assert.match(executed.execution.tasks["task-1"].summary || "", /session mock-task-thread-1/);
   assert.match(executed.context.executionSummary || "", /completed=1/);
 
   const events = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");

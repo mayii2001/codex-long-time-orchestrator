@@ -6,9 +6,6 @@ const sandboxMode = argv[argv.indexOf("-s") + 1];
 const plannerEphemeral = argv.includes("--ephemeral");
 const promptArgIndex = argv.lastIndexOf("-");
 const resumeIndex = argv.indexOf("resume");
-const plannerSessionId = resumeIndex >= 0 && promptArgIndex > resumeIndex
-  ? argv[promptArgIndex - 1]
-  : "mock-thread-1";
 const stdin = await new Promise((resolve) => {
   let raw = "";
   process.stdin.setEncoding("utf8");
@@ -19,6 +16,15 @@ const stdin = await new Promise((resolve) => {
     resolve(raw);
   });
 });
+const isPlannerPrompt = stdin.includes("planner model inside Codex Agent Orchestrator");
+const isResumedSession = resumeIndex >= 0 && promptArgIndex > resumeIndex;
+const sessionId = isResumedSession
+  ? argv[promptArgIndex - 1]
+  : isPlannerPrompt
+    ? "mock-thread-1"
+    : stdin.includes("Check iteration: 1")
+      ? "mock-task-thread-2"
+      : "mock-task-thread-1";
 
 async function incrementRetryCounter() {
   const counterPath = process.env.ORCH_MOCK_RETRY_FILE;
@@ -52,7 +58,7 @@ if (stdin.includes("context maintenance worker inside Codex Agent Orchestrator")
 }
 
 if (stdin.includes("planner model inside Codex Agent Orchestrator")) {
-  console.log(JSON.stringify({ type: "thread.started", thread_id: plannerSessionId }));
+  console.log(JSON.stringify({ type: "thread.started", thread_id: sessionId }));
   console.log(JSON.stringify({ type: "turn.started" }));
   if (stdin.includes("Force planner failure for test.")) {
     console.error("mock planner failure");
@@ -66,7 +72,7 @@ if (stdin.includes("planner model inside Codex Agent Orchestrator")) {
     };
   } else if (stdin.includes("Verify planner session resume.")) {
     response = {
-      assistant_response: `planner session resume: ${plannerSessionId}`,
+      assistant_response: `planner session resume: ${sessionId}`,
       plan_complete: false,
       plan_update: null,
     };
@@ -161,6 +167,44 @@ if (stdin.includes("planner model inside Codex Agent Orchestrator")) {
         ],
       },
     };
+  } else if (stdin.includes("Build a malformed plan missing worker prompt")) {
+    response = {
+      assistant_response: "I drafted a malformed plan for validation testing.",
+      plan_complete: true,
+      plan_update: {
+        summary: "This plan is intentionally missing a worker prompt.",
+        tasks: [
+          {
+            id: "task-1",
+            title: "Malformed task",
+            depends_on: [],
+            wait_range_ms: {
+              min: 1,
+              max: 20,
+            },
+          },
+        ],
+      },
+    };
+  } else if (stdin.includes("Build a malformed plan missing summary")) {
+    response = {
+      assistant_response: "I drafted a malformed plan without a plan summary.",
+      plan_complete: true,
+      plan_update: {
+        tasks: [
+          {
+            id: "task-1",
+            title: "Malformed task missing summary only",
+            depends_on: [],
+            worker_prompt: "Wait for 5 ms and then complete the task.",
+            wait_range_ms: {
+              min: 1,
+              max: 20,
+            },
+          },
+        ],
+      },
+    };
   } else if (stdin.includes("Build a plan")) {
     response = {
       assistant_response: "I drafted a first executable plan.",
@@ -201,6 +245,8 @@ if (stdin.includes("planner model inside Codex Agent Orchestrator")) {
     };
   }
 } else {
+  console.log(JSON.stringify({ type: "thread.started", thread_id: sessionId }));
+  console.log(JSON.stringify({ type: "turn.started" }));
   if (stdin.includes("Force task API reconnect failure for test.")) {
     const attempt = await incrementRetryCounter();
     console.error(`API reconnect failed on task attempt ${attempt}`);
@@ -227,7 +273,7 @@ if (stdin.includes("planner model inside Codex Agent Orchestrator")) {
   } else if (stdin.includes("Monitor a long-running task.")) {
     if (stdin.includes("Check iteration: 1")) {
       response = {
-        summary: "Long-running task finished on the scheduled follow-up check.",
+        summary: `Long-running task finished on the scheduled follow-up check with session ${sessionId}.`,
         should_wait: false,
         wait_ms: 0,
         completed: true,

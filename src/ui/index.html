@@ -157,7 +157,7 @@
       .muted { color: #94a3b8; }
       .toolbar {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
+        grid-template-columns: repeat(4, 1fr);
         gap: 8px;
       }
       .settings-row {
@@ -328,6 +328,7 @@
           <textarea id="message-input" placeholder="Talk to planner. Press Enter to send, Shift+Enter for newline."></textarea>
           <div class="toolbar" style="margin-top: 10px;">
             <button id="send-button">Send</button>
+            <button id="interrupt-planner-button">Interrupt Planner</button>
             <button id="freeze-button">Freeze Plan</button>
             <button id="execute-button">Start Execute</button>
           </div>
@@ -408,6 +409,9 @@
       const checkIntervalNode = document.getElementById("check-interval-ms");
       const maintainContextButton = document.getElementById("maintain-context-button");
       const saveSettingsButton = document.getElementById("save-settings-button");
+      const interruptPlannerButton = document.getElementById("interrupt-planner-button");
+      let plannerStreamController = null;
+      let plannerInterruptRequested = false;
 
       async function fetchJson(url, options) {
         const response = await fetch(url, options);
@@ -572,6 +576,7 @@
         freezeButton.disabled = missing.length > 0 || executionLive || run.planner.isStreaming;
         executeButton.disabled = !canResumeExecution;
         sendButton.disabled = run.planner.isStreaming;
+        interruptPlannerButton.disabled = !run.planner.isStreaming;
         saveSettingsButton.disabled = executionLive || run.planner.isStreaming;
         maintainContextButton.disabled = run.planner.isStreaming;
         if (!saveSettingsButton.disabled) {
@@ -683,6 +688,7 @@
         resetSettingsDirty();
         stopPlannerStatusTimer();
         terminateTaskButton.disabled = true;
+        interruptPlannerButton.disabled = true;
         draftNode.textContent = "No draft yet.";
         eventsNode.textContent = "[]";
         executeHintNode.textContent = "Select or create a run to continue.";
@@ -747,10 +753,12 @@
       }
 
       async function streamPlannerMessage(message) {
+        plannerStreamController = new AbortController();
         const response = await fetch(`/api/runs/${encodeURIComponent(activeRunId)}/planner/message/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message }),
+          signal: plannerStreamController.signal,
         });
         if (!response.ok || !response.body) {
           const maybeJson = await response.json().catch(() => null);
@@ -788,6 +796,10 @@
             } else if (event.type === "planner_completed") {
               streamingMessage = event.payload.assistantMessage || "";
               streamStatusNode.textContent = `Main agent replied in ${formatElapsedSeconds(plannerStartedAt)}.`;
+            } else if (event.type === "planner_interrupted") {
+              streamStatusNode.textContent = event.payload.message || "Planner interrupted.";
+              plannerInterruptRequested = true;
+              break;
             } else if (event.type === "error") {
               throw new Error(event.payload.message);
             }
@@ -809,6 +821,7 @@
         sendButton.disabled = true;
         pendingUserMessage = message;
         streamingMessage = "Main agent is thinking...";
+        plannerInterruptRequested = false;
         renderTurns(currentTurns);
         messageInput.value = "";
         startPlannerStatusTimer();
@@ -819,11 +832,38 @@
         } catch (error) {
           pendingUserMessage = "";
           messageInput.value = message;
-          alert(error.message);
+          const aborted = error && typeof error === "object" && error.name === "AbortError";
+          if (!aborted && !plannerInterruptRequested) {
+            alert(error.message);
+          }
         } finally {
+          plannerStreamController = null;
           streamingMessage = "";
           stopPlannerStatusTimer();
           await loadAll();
+          plannerInterruptRequested = false;
+        }
+      };
+
+      interruptPlannerButton.onclick = async () => {
+        if (!activeRunId) return;
+        interruptPlannerButton.disabled = true;
+        plannerInterruptRequested = true;
+        try {
+          await fetchJson(`/api/runs/${encodeURIComponent(activeRunId)}/planner/terminate`, {
+            method: "POST",
+          });
+          if (plannerStreamController && !plannerStreamController.signal.aborted) {
+            plannerStreamController.abort();
+          }
+          streamStatusNode.textContent = "Planner interruption requested.";
+          pendingUserMessage = "";
+          await loadAll();
+        } catch (error) {
+          plannerInterruptRequested = false;
+          alert(error.message);
+        } finally {
+          interruptPlannerButton.disabled = false;
         }
       };
 

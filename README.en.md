@@ -1,6 +1,6 @@
 # Codex Long-time Orchestrator
 
-[中文](README.md)
+[中文](README.zh.md)
 
 `Codex Long-time Orchestrator` is a local orchestration layer for `Codex CLI`. It is built for engineering work that does not finish in a single model call: long-running tests, smoke checks, remote jobs, repeated log inspection, bug fixing, and re-execution over time.
 
@@ -32,7 +32,7 @@ When you send a message in the web UI, the host loads the saved run context and 
 
 That design gives three useful properties. First, the run history is stored on disk. Second, refreshing the browser does not lose execution state. Third, if the host process is interrupted, the system can decide whether to resume planning, continue execution, or start the next cycle from the saved state.
 
-In the current implementation, the main agent and task workers no longer share the same context strategy. The main agent no longer runs in one-shot ephemeral mode. Instead, each run keeps a durable Codex planner session and later planner turns prefer `codex exec resume` so the same session can continue. Task workers stay short-lived, but for long-running tasks the host now injects execution checkpoints and deltas since the previous wake instead of forcing each wake-up to reconstruct context from loose history.
+In the current implementation, the main agent and task workers no longer share the same context strategy. The main agent no longer runs in one-shot ephemeral mode. Instead, each run keeps a durable Codex planner session and later planner turns prefer `codex exec resume` so the same session can continue. Repeated execution on the same task now keeps its own session id as well. Each wake still starts a fresh `codex` subprocess, but the second and later calls for the same task use `codex exec resume` so task-local context is preserved across wake cycles. The host still injects execution checkpoints and deltas since the previous wake instead of forcing each wake-up to reconstruct context from loose history.
 
 ## Installation and First Start
 
@@ -90,6 +90,8 @@ Once the draft is complete, click `Freeze Plan` to turn it into an execution pla
 
 The run history in the left sidebar prefers the topic from the first planning message for each run. That makes repeated attempts inside the same project easier to scan by intent instead of forcing you to recognize runs only by UUID.
 
+If a planner turn is taking too long, or the browser connection drops and you no longer want to wait, `Interrupt Planner` can stop the current main-agent turn explicitly. This terminates the backend `codex` planner subprocess itself instead of only cancelling the browser request. If the streaming browser connection drops unexpectedly, the backend also stops that planner turn automatically so the run does not stay stuck in `Planner is running...`.
+
 If a task is already running or waiting and you know the current attempt should stop, the `Task Process` panel can terminate the selected task explicitly. That interrupts the current run execution and writes the operator stop reason back into task state and event history so the next planning or rerun step starts from an honest state.
 
 If execution is interrupted, completed tasks remain recorded. The next time you open the run, you can continue planning or resume execution from the unfinished part.
@@ -134,6 +136,8 @@ If you set `ORCH_HOME`, that index will be written to the directory you specify.
 At this point, the project already has a usable main path. It supports starting directly from a project directory, browser-based planning, freezing an execution plan, background execution, preserved waiting state, continued conversation with the main agent during execution, and project-scoped run history.
 
 It also includes practical engineering features such as model selection, concurrency limits, a configurable check interval for long-running tasks, task process inspection, truncated large logs in the UI, and resume behavior that skips already completed tasks.
+
+Recent manual validation also includes a repeated 10-second wake-up scenario. For that scenario, a run is considered successful when `checkIteration` reaches at least `3`, which confirms that the orchestrator can wake the same task repeatedly instead of only surviving a single wait.
 
 That said, this is still not a fully validated production system. More advanced conflict-aware scheduling, stronger remote-job recovery, a fuller reviewer flow, stricter approval boundaries, and more mature filtering and comparison views still need work.
 
