@@ -22,6 +22,7 @@ export interface RunEvent {
 export interface WorkerResult {
   model: string;
   status: "pending" | "completed" | "failed";
+  ephemeral: boolean;
   promptPath: string;
   schemaPath: string;
   responsePath: string;
@@ -98,6 +99,21 @@ export interface PlannerState {
   isStreaming: boolean;
 }
 
+export interface PlannerPromptContextMeta {
+  estimatedTokens: number;
+  compressed: boolean;
+  retainedTurnCount: number;
+  summarizedTurnCount: number;
+}
+
+export interface RunContextState {
+  goalSummary: string | null;
+  planSummary: string | null;
+  executionSummary: string | null;
+  conversationSummary: string | null;
+  plannerPrompt: PlannerPromptContextMeta | null;
+}
+
 export interface TaskExecutionRecord {
   taskId: string;
   title: string;
@@ -116,6 +132,10 @@ export interface TaskExecutionRecord {
   lastCheckAt?: string;
   nextCheckAt?: string;
   summary?: string;
+  checkpointSummary?: string;
+  wakeDeltaSummary?: string;
+  lastWakeEventCount?: number;
+  lastWakeNoteCount?: number;
 }
 
 export interface ExecutionState {
@@ -140,6 +160,7 @@ export interface RunRecord {
   status: RunStatus;
   settings: RunSettings;
   notes: string[];
+  context: RunContextState;
   planner: PlannerState;
   execution: ExecutionState;
   runtime: RunRuntimeState;

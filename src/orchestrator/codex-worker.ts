@@ -3,9 +3,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 
-import { getPlannerRoot, getTaskRoot, writeWorkerResult } from "./run-store.js";
+import { assemblePlannerPrompt, assembleTaskPrompt } from "./context-assembler.js";
+import { getPlannerRoot, getTaskRoot, listRunEvents, readActiveDraft, writeWorkerResult } from "./run-store.js";
 import type {
   PlanTask,
+  PlannerTurnRecord,
   PlannerResponseEnvelope,
   RunRecord,
   TaskExecutionRecord,
@@ -52,6 +54,7 @@ function buildExecArgs(
   sandboxMode: "read-only" | "workspace-write",
   schemaPath: string,
   responsePath: string,
+  ephemeral: boolean,
 ): string[] {
   return [
     "exec",
@@ -60,7 +63,7 @@ function buildExecArgs(
     "-s",
     sandboxMode,
     "--skip-git-repo-check",
-    "--ephemeral",
+    ...(ephemeral ? ["--ephemeral"] : []),
     "--json",
     "--output-schema",
     schemaPath,
@@ -201,51 +204,6 @@ function buildPlannerSchema(): string {
   );
 }
 
-function buildPlannerPrompt(run: RunRecord, conversationText: string, projectInstructions: string | null): string {
-  const taskLines = run.execution.taskOrder.map((taskId) => {
-    const task = run.execution.tasks[taskId];
-    const waitUntil = task.waitUntil ? `, waitUntil=${task.waitUntil}` : "";
-    const nextCheckAt = task.nextCheckAt ? `, nextCheckAt=${task.nextCheckAt}` : "";
-    const iteration = task.checkIteration !== undefined ? `, checkIteration=${task.checkIteration}` : "";
-    return `- ${task.taskId}: mode=${task.taskMode || "default"}, status=${task.status}, action=${task.currentAction || "-"}, summary=${task.summary || "-"}${waitUntil}${nextCheckAt}${iteration}`;
-  });
-  const executionLive = Boolean(run.runtime.executionOwnerId && run.runtime.executionHeartbeatAt);
-  return [
-    "You are the planner model inside Codex Agent Orchestrator.",
-    "Behave like a normal helpful Codex planner in tone.",
-    "Respond to the user naturally in assistant_response.",
-    executionLive
-      ? "The main execution is currently active. Act as the main agent for this run: answer progress, blockers, next steps, and current task status."
-      : "You can answer progress questions and also act as planner for this run.",
-    executionLive
-      ? "While execution is active, always set plan_update to null and do not attempt to revise the plan."
-      : "Only set plan_update when the current plan materially changed.",
-    "If nothing changed in the plan, set plan_update to null.",
-    "When you emit plan_update, it must be a complete plan snapshot, not a partial diff.",
-    "A valid task must include: id, title, depends_on, worker_prompt, wait_range_ms.min, wait_range_ms.max.",
-    "You may optionally set task_mode to long-running when the task launches or supervises a long-running external job.",
-    "wait_range_ms defines the allowed wait range.",
-    "For long-running tasks, the run-level check interval controls how often the orchestrator wakes the model again and that interval must stay inside wait_range_ms.",
-    "Keep the plan practical and executable.",
-    "",
-    `Run ID: ${run.runId}`,
-    `Project path: ${run.repoPath}`,
-    `Run phase: ${run.phase}`,
-    `Run status: ${run.status}`,
-    `Execution live: ${executionLive ? "yes" : "no"}`,
-    `Configured check interval: ${run.settings.checkIntervalMs} ms`,
-    `Latest planner message: ${run.planner.latestAssistantMessage || "-"}`,
-    `Notes: ${run.notes.length ? run.notes.slice(-3).join(" | ") : "-"}`,
-    "Project instructions:",
-    projectInstructions || "- none",
-    "Execution task snapshot:",
-    ...(taskLines.length ? taskLines : ["- no frozen tasks yet"]),
-    "",
-    "Conversation history follows:",
-    conversationText,
-  ].join("\n");
-}
-
 function buildTaskSchema(): string {
   return JSON.stringify(
     {
@@ -264,47 +222,6 @@ function buildTaskSchema(): string {
   );
 }
 
-function buildTaskPrompt(
-  run: RunRecord,
-  task: PlanTask,
-  taskState: TaskExecutionRecord | undefined,
-  projectInstructions: string | null,
-): string {
-  const lines = [
-    "You are an execution worker inside Codex Agent Orchestrator.",
-    "Return JSON only.",
-    "This worker gets exactly one task.",
-    "If you choose should_wait true, the wait_ms value must stay inside the allowed wait range.",
-    task.taskMode === "long-running"
-      ? "This is a long-running supervision task. Use this turn to inspect progress, read logs, fix bugs, restart commands if needed, and decide whether another scheduled check is required."
-      : "For default tasks, a task that waits must also complete after that wait.",
-    "",
-    `Task ID: ${task.id}`,
-    `Task title: ${task.title}`,
-    `Task mode: ${task.taskMode}`,
-    `Allowed wait range: ${task.waitPolicy.minMs} to ${task.waitPolicy.maxMs} ms`,
-    `Configured check interval: ${run.settings.checkIntervalMs} ms`,
-    "Project instructions:",
-    projectInstructions || "- none",
-  ];
-  if (taskState) {
-    lines.push(
-      `Current status: ${taskState.status}`,
-      `Current action: ${taskState.currentAction || "-"}`,
-      `Check iteration: ${taskState.checkIteration ?? 0}`,
-      `Last check at: ${taskState.lastCheckAt || "-"}`,
-      `Next scheduled check: ${taskState.nextCheckAt || "-"}`,
-      `Last summary: ${taskState.summary || "-"}`,
-    );
-  }
-  lines.push(
-    "",
-    "Worker instructions:",
-    task.workerPrompt,
-  );
-  return lines.join("\n");
-}
-
 async function persistWorkerArtifacts(
   workerRoot: string,
   prompt: string,
@@ -316,12 +233,13 @@ async function persistWorkerArtifacts(
   responsePath: string;
   stdoutPath: string;
   stderrPath: string;
-  run: (
-    stdinContent: string,
-    model: string,
-    sandboxMode: "read-only" | "workspace-write",
-    onJsonEvent?: (event: unknown) => void,
-  ) => Promise<WorkerResult>;
+    run: (
+      stdinContent: string,
+      model: string,
+      sandboxMode: "read-only" | "workspace-write",
+      ephemeral: boolean,
+      onJsonEvent?: (event: unknown) => void,
+    ) => Promise<WorkerResult>;
 }> {
   await fs.mkdir(workerRoot, { recursive: true });
   const promptPath = path.join(workerRoot, "prompt.txt");
@@ -343,10 +261,11 @@ async function persistWorkerArtifacts(
       stdinContent: string,
       model: string,
       sandboxMode: "read-only" | "workspace-write",
+      ephemeral: boolean,
       onJsonEvent?: (event: unknown) => void,
     ) => {
       const result = await runCodexCommand(
-        buildExecArgs(model, sandboxMode, schemaPath, responsePath),
+        buildExecArgs(model, sandboxMode, schemaPath, responsePath, ephemeral),
         cwd,
         stdinContent,
         onJsonEvent,
@@ -358,6 +277,7 @@ async function persistWorkerArtifacts(
       return {
         model,
         status: result.exitCode === 0 ? "completed" : "failed",
+        ephemeral,
         promptPath,
         schemaPath,
         responsePath,
@@ -371,16 +291,25 @@ async function persistWorkerArtifacts(
 
 export async function runPlannerTurn(
   run: RunRecord,
-  conversationText: string,
+  turns: PlannerTurnRecord[],
+  userMessage: string,
   onJsonEvent?: (event: unknown) => void,
-): Promise<{ envelope: PlannerResponseEnvelope; worker: WorkerResult }> {
+): Promise<{ envelope: PlannerResponseEnvelope; worker: WorkerResult; context: RunRecord["context"] }> {
   const turnId = crypto.randomUUID();
   const workerRoot = path.join(getPlannerRoot(run.repoPath, run.runId), "turn-artifacts", turnId);
   const projectInstructions = await readProjectAgentInstructions(run.repoPath);
-  const prompt = buildPlannerPrompt(run, conversationText, projectInstructions);
+  const draft = await readActiveDraft(run.repoPath, run.runId);
+  const assembled = assemblePlannerPrompt({
+    run,
+    turns,
+    userMessage,
+    draft,
+    projectInstructions,
+  });
+  const prompt = assembled.prompt;
   const schema = buildPlannerSchema();
   const artifact = await persistWorkerArtifacts(workerRoot, prompt, schema, run.repoPath);
-  const worker = await artifact.run(prompt, run.settings.plannerModel, "read-only", onJsonEvent);
+  const worker = await artifact.run(prompt, run.settings.plannerModel, "read-only", false, onJsonEvent);
 
   if (worker.exitCode !== 0) {
     throw new Error(`Planner turn failed with exit code ${worker.exitCode}.`);
@@ -390,6 +319,7 @@ export async function runPlannerTurn(
   return {
     envelope: JSON.parse(content) as PlannerResponseEnvelope,
     worker,
+    context: assembled.context,
   };
 }
 
@@ -398,13 +328,27 @@ export async function runTaskWorker(
   task: PlanTask,
   taskState?: TaskExecutionRecord,
   onJsonEvent?: (event: unknown) => void,
-): Promise<{ response: TaskWorkerResponse; worker: WorkerResult }> {
+): Promise<{
+  response: TaskWorkerResponse;
+  worker: WorkerResult;
+  contextPatch: Pick<TaskExecutionRecord, "checkpointSummary" | "wakeDeltaSummary" | "lastWakeEventCount" | "lastWakeNoteCount">;
+}> {
   const workerRoot = path.join(getTaskRoot(run.repoPath, run.runId, task.id), "worker");
   const projectInstructions = await readProjectAgentInstructions(run.repoPath);
-  const prompt = buildTaskPrompt(run, task, taskState, projectInstructions);
+  const draft = await readActiveDraft(run.repoPath, run.runId);
+  const events = await listRunEvents(run.repoPath, run.runId);
+  const assembled = assembleTaskPrompt({
+    run,
+    draft,
+    task,
+    taskState,
+    projectInstructions,
+    events,
+  });
+  const prompt = assembled.prompt;
   const schema = buildTaskSchema();
   const artifact = await persistWorkerArtifacts(workerRoot, prompt, schema, run.repoPath);
-  const worker = await artifact.run(prompt, run.settings.taskWorkerModel, "workspace-write", onJsonEvent);
+  const worker = await artifact.run(prompt, run.settings.taskWorkerModel, "workspace-write", true, onJsonEvent);
 
   await writeWorkerResult(run.repoPath, run.runId, task.id, worker);
 
@@ -413,8 +357,15 @@ export async function runTaskWorker(
   }
 
   const content = await fs.readFile(artifact.responsePath, "utf8");
+  const response = JSON.parse(content) as TaskWorkerResponse;
   return {
-    response: JSON.parse(content) as TaskWorkerResponse,
+    response,
     worker,
+    contextPatch: {
+      checkpointSummary: response.summary,
+      wakeDeltaSummary: assembled.wakeDeltaSummary ?? undefined,
+      lastWakeEventCount: assembled.wakeEventCount,
+      lastWakeNoteCount: assembled.wakeNoteCount,
+    },
   };
 }

@@ -197,6 +197,13 @@ export async function readRunState(repoPath: string, runId: string): Promise<Run
       missingFields: parsed.planner?.missingFields ?? ["No plan draft yet."],
       isStreaming: parsed.planner?.isStreaming ?? false,
     },
+    context: {
+      goalSummary: parsed.context?.goalSummary ?? null,
+      planSummary: parsed.context?.planSummary ?? null,
+      executionSummary: parsed.context?.executionSummary ?? null,
+      conversationSummary: parsed.context?.conversationSummary ?? null,
+      plannerPrompt: parsed.context?.plannerPrompt ?? null,
+    },
     execution: parsed.execution ?? {
       taskOrder: [],
       tasks: {},
@@ -259,6 +266,7 @@ export async function updateRunState(
     ...current,
     ...patch,
     planner: patch.planner ?? current.planner,
+    context: patch.context ?? current.context,
     execution: patch.execution ?? current.execution,
     runtime: patch.runtime ?? current.runtime,
     updatedAt: new Date().toISOString(),

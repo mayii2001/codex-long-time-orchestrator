@@ -11,6 +11,7 @@ import {
   getExecutionPlanPath,
   getStatePath,
   getTaskRoot,
+  listPlannerTurns,
   readActiveDraft,
   readProjectIndex,
   readRunState,
@@ -50,6 +51,9 @@ test("planner message updates draft, freezes, and executes task", async () => {
   const draft = await readActiveDraft(repoPath, record.runId);
   assert.equal(afterMessage.planner.turnCount, 1);
   assert.equal(afterMessage.planner.canExecute, true);
+  assert.match(afterMessage.context.goalSummary || "", /Build a plan/);
+  assert.match(afterMessage.context.planSummary || "", /Execute one task/);
+  assert.equal(afterMessage.context.plannerPrompt?.compressed, false);
   assert.equal(draft?.tasks.length, 1);
 
   const frozen = await freezeCurrentDraft(afterMessage);
@@ -63,6 +67,26 @@ test("planner message updates draft, freezes, and executes task", async () => {
   assert.equal(executed.execution.tasks["task-1"].status, "completed");
   assert.match(events, /execution_plan_frozen/);
   assert.match(events, /task_wait_started/);
+
+  delete process.env.ORCH_HOME;
+  delete process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_ARGS;
+});
+
+test("planner main agent runs without ephemeral mode", async () => {
+  const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-persistence-"));
+  const homePath = await fs.mkdtemp(path.join(os.tmpdir(), "codex-agent-orchestrator-home-"));
+  process.env.ORCH_HOME = homePath;
+  process.env.ORCH_CODEX_BIN = process.execPath;
+  process.env.ORCH_CODEX_ARGS = path.resolve("test", "fixtures", "mock-codex.mjs");
+
+  const record = await createRunScaffold({ repoPath });
+  const next = await submitPlannerMessage(record, "Verify planner persistence mode.");
+  const turns = await listPlannerTurns(repoPath, record.runId);
+
+  assert.equal(next.planner.turnCount, 1);
+  assert.equal(turns[0]?.assistantMessage, "planner persistence: durable");
+  assert.equal(turns[0]?.worker.ephemeral, false);
 
   delete process.env.ORCH_HOME;
   delete process.env.ORCH_CODEX_BIN;
@@ -183,11 +207,19 @@ test("long-running task uses check interval and re-wakes the worker", async () =
   assert.equal(executed.execution.tasks["task-1"].taskMode, "long-running");
   assert.equal(executed.execution.tasks["task-1"].checkIteration, 1);
   assert.equal(executed.execution.tasks["task-1"].checkIntervalMs, 5);
+  assert.match(executed.execution.tasks["task-1"].checkpointSummary || "", /Long-running task finished/);
+  assert.match(executed.execution.tasks["task-1"].wakeDeltaSummary || "", /task_check_scheduled/);
+  assert.equal(typeof executed.execution.tasks["task-1"].lastWakeEventCount, "number");
   assert.match(executed.execution.tasks["task-1"].summary || "", /scheduled follow-up check/);
+  assert.match(executed.context.executionSummary || "", /completed=1/);
 
   const events = await fs.readFile(getEventsPath(repoPath, record.runId), "utf8");
   assert.match(events, /task_check_scheduled/);
   assert.match(events, /task_check_started/);
+  const workerPrompt = await fs.readFile(path.join(getTaskRoot(repoPath, record.runId, "task-1"), "worker", "prompt.txt"), "utf8");
+  assert.match(workerPrompt, /Wake delta since previous check:/);
+  assert.match(workerPrompt, /task_check_scheduled/);
+  assert.match(workerPrompt, /Last task checkpoint:/);
 
   delete process.env.ORCH_HOME;
   delete process.env.ORCH_CODEX_BIN;

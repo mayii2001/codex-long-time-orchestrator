@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 
+import { buildRunContextState } from "./context-assembler.js";
 import {
   appendPlannerTurn,
   appendRunEvent,
@@ -133,16 +134,6 @@ function convertDraft(version: number, source: NonNullable<Awaited<ReturnType<ty
   };
 }
 
-function formatConversation(turns: PlannerTurnRecord[], userMessage: string): string {
-  const lines: string[] = [];
-  for (const turn of turns) {
-    lines.push(`user: ${turn.userMessage}`);
-    lines.push(`assistant: ${turn.assistantMessage}`);
-  }
-  lines.push(`user: ${userMessage}`);
-  return lines.join("\n");
-}
-
 function buildInitialExecutionState(tasks: PlanTask[]): ExecutionState {
   const state: ExecutionState = {
     taskOrder: tasks.map((task) => task.id),
@@ -217,16 +208,31 @@ async function setPlannerStreamingState(run: RunRecord, isStreaming: boolean): P
   });
 }
 
+async function refreshRunContext(
+  repoPath: string,
+  runId: string,
+  overrides?: {
+    turns?: PlannerTurnRecord[];
+    draft?: PlanDraft | null;
+    plannerPrompt?: RunRecord["context"]["plannerPrompt"];
+  },
+): Promise<RunRecord> {
+  const current = await readRunState(repoPath, runId);
+  const turns = overrides?.turns ?? await listPlannerTurns(repoPath, runId);
+  const draft = overrides?.draft !== undefined ? overrides.draft : await readActiveDraft(repoPath, runId);
+  const context = buildRunContextState(current, turns, draft, overrides?.plannerPrompt ?? current.context.plannerPrompt);
+  return await updateRunState(repoPath, runId, { context });
+}
+
 export async function submitPlannerMessage(run: RunRecord, userMessage: string): Promise<RunRecord> {
   const currentRun = isExecutionLive(run)
     ? run
     : await reopenRunForPlanning(run, "Planner resumed after previous execution state ended.");
   const turns = await listPlannerTurns(run.repoPath, run.runId);
-  const conversationText = formatConversation(turns, userMessage);
   await setPlannerStreamingState(currentRun, true);
 
   try {
-    const { envelope, worker } = await runPlannerTurn(currentRun, conversationText);
+    const { envelope, worker, context: plannerContext } = await runPlannerTurn(currentRun, turns, userMessage);
     const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
 
     let draftVersion = currentRun.planner.activeDraftVersion ?? 0;
@@ -253,7 +259,7 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
     };
     await appendPlannerTurn(currentRun.repoPath, currentRun.runId, turn);
 
-    const next = await updateRunState(currentRun.repoPath, currentRun.runId, {
+    await updateRunState(currentRun.repoPath, currentRun.runId, {
       title: runTitle,
       planner: {
         turnCount: turns.length + 1,
@@ -263,6 +269,11 @@ export async function submitPlannerMessage(run: RunRecord, userMessage: string):
         missingFields,
         isStreaming: false,
       },
+    });
+    const next = await refreshRunContext(currentRun.repoPath, currentRun.runId, {
+      turns: [...turns, turn],
+      draft: activeDraft,
+      plannerPrompt: plannerContext.plannerPrompt,
     });
 
     await appendRunEvent(currentRun.repoPath, currentRun.runId, {
@@ -288,12 +299,11 @@ export async function submitPlannerMessageWithEvents(
     ? run
     : await reopenRunForPlanning(run, "Planner resumed after previous execution state ended.");
   const turns = await listPlannerTurns(run.repoPath, run.runId);
-  const conversationText = formatConversation(turns, userMessage);
   await setPlannerStreamingState(currentRun, true);
   onEvent({ type: "planner_started", payload: { message: "Planner started." } });
 
   try {
-    const { envelope, worker } = await runPlannerTurn(currentRun, conversationText, (jsonEvent) => {
+    const { envelope, worker, context: plannerContext } = await runPlannerTurn(currentRun, turns, userMessage, (jsonEvent) => {
       onEvent({ type: "planner_event", payload: jsonEvent });
     });
     const runTitle = currentRun.title ?? (turns.length === 0 ? summarizeRunTitle(userMessage) : null);
@@ -323,7 +333,7 @@ export async function submitPlannerMessageWithEvents(
     };
     await appendPlannerTurn(currentRun.repoPath, currentRun.runId, turn);
 
-    const next = await updateRunState(currentRun.repoPath, currentRun.runId, {
+    await updateRunState(currentRun.repoPath, currentRun.runId, {
       title: runTitle,
       planner: {
         turnCount: turns.length + 1,
@@ -333,6 +343,11 @@ export async function submitPlannerMessageWithEvents(
         missingFields,
         isStreaming: false,
       },
+    });
+    const next = await refreshRunContext(currentRun.repoPath, currentRun.runId, {
+      turns: [...turns, turn],
+      draft: activeDraft,
+      plannerPrompt: plannerContext.plannerPrompt,
     });
 
     await appendRunEvent(currentRun.repoPath, currentRun.runId, {
@@ -416,7 +431,8 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
   };
   await updateRunState(run.repoPath, run.runId, { execution });
 
-  const { response } = await runTaskWorker(run, task, execution.tasks[task.id]);
+  const workerRun = await readRunState(run.repoPath, run.runId);
+  const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id]);
 
   if (response.should_wait) {
     if (response.wait_ms < task.waitPolicy.minMs || response.wait_ms > task.waitPolicy.maxMs) {
@@ -430,9 +446,14 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
       waitStartedAt: new Date().toISOString(),
       waitUntil: new Date(Date.now() + response.wait_ms).toISOString(),
       summary: response.summary,
+      checkpointSummary: contextPatch.checkpointSummary,
+      wakeDeltaSummary: contextPatch.wakeDeltaSummary,
+      lastWakeEventCount: contextPatch.lastWakeEventCount,
+      lastWakeNoteCount: contextPatch.lastWakeNoteCount,
       updatedAt: new Date().toISOString(),
     };
     await updateRunState(run.repoPath, run.runId, { execution, phase: "waiting" });
+    await refreshRunContext(run.repoPath, run.runId);
     await appendRunEvent(run.repoPath, run.runId, {
       timestamp: new Date().toISOString(),
       type: "task_wait_started",
@@ -456,11 +477,16 @@ async function executeDefaultTask(run: RunRecord, task: PlanTask, execution: Exe
     currentAction: "completed",
     waitDecisionMs: response.wait_ms,
     summary: response.summary,
+    checkpointSummary: contextPatch.checkpointSummary,
+    wakeDeltaSummary: contextPatch.wakeDeltaSummary,
+    lastWakeEventCount: contextPatch.lastWakeEventCount,
+    lastWakeNoteCount: contextPatch.lastWakeNoteCount,
     updatedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
   };
   await updateRunState(run.repoPath, run.runId, { execution, phase: "executing" });
   await appendRunNote(run.repoPath, run.runId, `Task ${task.id} completed: ${response.summary}`);
+  await refreshRunContext(run.repoPath, run.runId);
   return execution;
 }
 
@@ -490,7 +516,8 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
       detail: `Task ${task.id} check iteration ${execution.tasks[task.id].checkIteration ?? 0} started.`,
     });
 
-    const { response } = await runTaskWorker(run, task, execution.tasks[task.id]);
+    const workerRun = await readRunState(run.repoPath, run.runId);
+    const { response, contextPatch } = await runTaskWorker(workerRun, task, execution.tasks[task.id]);
     const checkedAt = new Date().toISOString();
 
     if (response.completed) {
@@ -502,6 +529,10 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
         checkIntervalMs,
         lastCheckAt: checkedAt,
         summary: response.summary,
+        checkpointSummary: contextPatch.checkpointSummary,
+        wakeDeltaSummary: contextPatch.wakeDeltaSummary,
+        lastWakeEventCount: contextPatch.lastWakeEventCount,
+        lastWakeNoteCount: contextPatch.lastWakeNoteCount,
         updatedAt: checkedAt,
         completedAt: checkedAt,
         nextCheckAt: undefined,
@@ -509,6 +540,7 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
       };
       await updateRunState(run.repoPath, run.runId, { execution, phase: "executing" });
       await appendRunNote(run.repoPath, run.runId, `Task ${task.id} completed: ${response.summary}`);
+      await refreshRunContext(run.repoPath, run.runId);
       return execution;
     }
 
@@ -530,9 +562,14 @@ async function executeLongRunningTask(run: RunRecord, task: PlanTask, execution:
       lastCheckAt: checkedAt,
       nextCheckAt,
       summary: response.summary,
+      checkpointSummary: contextPatch.checkpointSummary,
+      wakeDeltaSummary: contextPatch.wakeDeltaSummary,
+      lastWakeEventCount: contextPatch.lastWakeEventCount,
+      lastWakeNoteCount: contextPatch.lastWakeNoteCount,
       updatedAt: checkedAt,
     };
     await updateRunState(run.repoPath, run.runId, { execution, phase: "waiting" });
+    await refreshRunContext(run.repoPath, run.runId);
     await appendRunEvent(run.repoPath, run.runId, {
       timestamp: checkedAt,
       type: "task_check_scheduled",
@@ -566,6 +603,7 @@ export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
       executionHeartbeatAt: new Date().toISOString(),
     },
   });
+  await refreshRunContext(run.repoPath, run.runId);
   await appendRunEvent(run.repoPath, run.runId, {
     timestamp: new Date().toISOString(),
     type: "status_changed",
@@ -627,12 +665,13 @@ export async function executeFrozenPlan(run: RunRecord): Promise<RunRecord> {
     }
 
     await setRunStatus(run.repoPath, run.runId, "completed", "done", "Run completed successfully.");
-    return await updateRunState(run.repoPath, run.runId, {
+    await updateRunState(run.repoPath, run.runId, {
       runtime: {
         executionOwnerId: null,
         executionHeartbeatAt: null,
       },
     });
+    return await refreshRunContext(run.repoPath, run.runId);
   } finally {
     clearInterval(heartbeatTimer);
   }
@@ -656,10 +695,11 @@ export async function freezeCurrentDraft(run: RunRecord): Promise<RunRecord> {
     },
     execution,
   });
+  const refreshed = await refreshRunContext(run.repoPath, run.runId, { draft });
   await appendRunEvent(run.repoPath, run.runId, {
     timestamp: new Date().toISOString(),
     type: "execution_plan_frozen",
     detail: `Frozen execution plan from draft v${draft.version}.`,
   });
-  return next;
+  return refreshed;
 }

@@ -39,6 +39,13 @@ export async function createRunScaffold(input: CreateRunInput): Promise<RunRecor
       checkIntervalMs: DEFAULT_CHECK_INTERVAL_MS,
     },
     notes: ["Run scaffold created."],
+    context: {
+      goalSummary: null,
+      planSummary: null,
+      executionSummary: null,
+      conversationSummary: null,
+      plannerPrompt: null,
+    },
     planner: {
       turnCount: 0,
       activeDraftVersion: null,

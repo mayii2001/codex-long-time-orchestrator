@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 const argv = process.argv.slice(2);
 const outputPath = argv[argv.indexOf("--output-last-message") + 1];
 const sandboxMode = argv[argv.indexOf("-s") + 1];
+const plannerEphemeral = argv.includes("--ephemeral");
 const stdin = await new Promise((resolve) => {
   let raw = "";
   process.stdin.setEncoding("utf8");
@@ -21,7 +22,12 @@ if (stdin.includes("planner model inside Codex Agent Orchestrator")) {
     console.error("mock planner failure");
     process.exit(1);
   }
-  if (stdin.includes("Build a long-running plan")) {
+  if (stdin.includes("Verify planner persistence mode.")) {
+    response = {
+      assistant_response: plannerEphemeral ? "planner persistence: ephemeral" : "planner persistence: durable",
+      plan_update: null,
+    };
+  } else if (stdin.includes("Build a long-running plan")) {
     response = {
       assistant_response: "I drafted a long-running supervision plan.",
       plan_update: {

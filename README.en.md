@@ -32,6 +32,8 @@ When you send a message in the web UI, the host loads the saved run context and 
 
 That design gives three useful properties. First, the run history is stored on disk. Second, refreshing the browser does not lose execution state. Third, if the host process is interrupted, the system can decide whether to resume planning, continue execution, or start the next cycle from the saved state.
 
+In the current implementation, the main agent and task workers no longer share the same context strategy. The main agent no longer runs in one-shot ephemeral mode. Instead, it relies on host-managed run checkpoints so long-lived work keeps a more stable sense of goal and plan. Task workers stay short-lived, but for long-running tasks the host now injects execution checkpoints and deltas since the previous wake instead of forcing each wake-up to reconstruct context from loose history.
+
 ## Installation and First Start
 
 The following is the recommended setup flow. Once it is done, you can use `orch` directly from any project directory.
@@ -114,6 +116,8 @@ Each run is written under:
 ```
 
 This contains state, events, planner history, draft versions, the frozen execution plan, and worker output for each task.
+
+The run state also stores checkpoint summaries used for context management, including goal, plan, execution, and planner prompt compression metadata. Long-running task records keep their own checkpoint summary plus wake cursors so the next scheduled check can receive delta-based context.
 
 By default, the user directory only stores a global project index:
 
