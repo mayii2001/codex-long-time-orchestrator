@@ -1,10 +1,12 @@
-# Codex Agent Orchestrator
+# Codex Long-time Orchestrator
 
-`Codex Agent Orchestrator` 是一个把 `Codex CLI` 接到长时间工作流里的本地编排器。它面向的不是一次性问答，而是那类真正会持续几十分钟、几小时，甚至需要反复检查日志、修复问题、重新执行的工程任务。
+`Codex Long-time Orchestrator` 是一个把 `Codex CLI` 接到长时间工作流里的本地编排器。它面向的不是一次性问答，而是那类真正会持续几十分钟、几小时，甚至需要反复检查日志、修复问题、重新执行的工程任务。
 
  `codex` 流程进入等待、轮询、远端任务、长时间测试或 smoke 检查时，原来的会话容易中断且无法定时唤醒继续TDD。这个项目的目标，就是把“模型负责思考和执行”与“宿主进程负责等待、唤起、保存状态和展示历史”拆开，让任务能够持续跑下去，而不是停在某一次超时之后。
 
-对老板和使用者来说，可以把它理解成一个面向工程实验循环的控制台。你在网页里和主 agent 对话，主 agent 生成计划、启动执行、在等待周期里再次被唤起检查进度、决定是否修代码或继续跑。所有这些过程都会按项目留下历史记录，便于复盘和汇报。
+对使用者来说，可以把它理解成一个面向工程实验循环的控制台。你在网页里和主 agent 对话，主 agent 生成计划、启动执行、在等待周期里再次被唤起检查进度、决定是否修代码或继续跑。所有这些过程都会按项目留下历史记录，便于复盘和汇报。
+
+`Codex Long-time Orchestrator` is a local orchestrator that integrates `Codex CLI` into long-term workflows. It is not designed for one-off queries, but rather for engineering tasks that typically last for several minutes, hours, or even require repeated log checking, issue resolution, and re-execution. When the `codex` process enters waiting, polling, remote tasks, long-term testing, or smoke checks, the original session is prone to interruption and cannot be awakened to continue TDD at a fixed interval. The goal of this project is to separate "the model responsible for thinking and executing" from "the host process responsible for waiting, awakening, saving state, and presenting history", allowing the task to continue running rather than stopping after a certain timeout. For users, it can be understood as a console for engineering experimentation cycles. You interact with the main agent through the web page, and the main agent generates plans, initiates execution, is awakened again during the waiting period to check progress, and decides whether to fix the code or continue running. All these processes will leave a historical record for the project, facilitating review and reporting.
 
 ## 它解决什么问题
 
@@ -24,7 +26,7 @@
 
 ## 它如何工作
 
-这个系统不是一个永远挂着的超长 Codex 会话。它的工作方式更像一个常驻宿主去反复调用模型。
+本系统不是一个永远挂着的超长 Codex 会话。它的工作方式更像一个常驻宿主去反复调用模型。
 
 当你在网页里发送一条消息时，宿主会读取当前 run 已保存的上下文，再发起一次真实的 `codex exec`。当执行进入等待期时，等待由 orchestrator 自己持有，而不是让某个 Codex 进程在后台无意义地挂着。等到下一次检查时间到了，宿主再重新唤起模型，让它基于最新状态继续判断、修复或推进任务。
 
